@@ -10,7 +10,7 @@ A mini SQLite/Postgres-style database engine built from scratch in Go.
 | **B+ Tree** | `internal/btree/` | Core index structure — sorted key-value storage with range scans |
 | **WAL** | `internal/wal/` | Write-Ahead Log — crash recovery using ARIES (redo/undo) |
 | **SQL Parser** | `internal/parser/` | Lexer + recursive descent parser → AST |
-| **Query Engine** | `internal/engine/` | Executes AST against storage, handles IndexScan vs SeqScan |
+| **Query Engine** | `internal/engine/` | Executes AST against storage, IndexScan / SeqScan / NestedLoopJoin |
 | **Catalog** | `internal/catalog/` | Table and column schema metadata (persisted as JSON) |
 | **REPL** | `cmd/minidb/` | Interactive SQL shell |
 
@@ -27,27 +27,49 @@ go build -o minidb cmd/minidb/main.go
 
 ## Example Session
 
+### Basic CRUD + New Types
 ```sql
 minidb> CREATE TABLE users (id INT, name TEXT, age INT);
 minidb> INSERT INTO users VALUES (1, 'karim', 30);
 minidb> INSERT INTO users VALUES (2, 'hassan', 25);
-minidb> INSERT INTO users VALUES (3, 'hello', 35);
-minidb> SELECT * FROM users;
-+----+-------+-----+
-| id | name  | age |
-+----+-------+-----+
-| 1  | karim | 30  |
-| 2  | mokh   | 25  |
-| 3  | hello | 35  |
-+----+-------+-----+
-3 row(s)
-
 minidb> SELECT * FROM users WHERE age > 25;
-minidb> SELECT name FROM users ORDER BY age DESC;
 minidb> UPDATE users SET age = 31 WHERE id = 1;
 minidb> DELETE FROM users WHERE id = 2;
+
+-- FLOAT and BOOL columns
+minidb> CREATE TABLE products (id INT, name TEXT, price FLOAT, active BOOL);
+minidb> INSERT INTO products VALUES (1, 'apple', 1.99, TRUE);
+minidb> INSERT INTO products VALUES (2, 'candy', 0.50, FALSE);
+minidb> SELECT * FROM products WHERE price > 1.0;
+minidb> SELECT * FROM products WHERE active = TRUE;
+```
+
+### JOIN Queries
+```sql
+minidb> CREATE TABLE users (id INT, name TEXT);
+minidb> CREATE TABLE orders (id INT, user_id INT, item TEXT);
+minidb> INSERT INTO users VALUES (1, 'Alice');
+minidb> INSERT INTO users VALUES (2, 'Bob');
+minidb> INSERT INTO orders VALUES (1, 1, 'book');
+minidb> INSERT INTO orders VALUES (2, 1, 'pen');
+minidb> INSERT INTO orders VALUES (3, 99, 'ghost');  -- no matching user
+
+-- INNER JOIN: only matched rows
+minidb> SELECT * FROM orders INNER JOIN users ON orders.user_id = users.id;
++----------+-----------+-------------+----------+-----------+
+| orders.id| orders.user_id | orders.item | users.id | users.name|
++----------+-----------+-------------+----------+-----------+
+| 1        | 1         | book        | 1        | Alice     |
+| 2        | 1         | pen         | 1        | Alice     |
++----------+-----------+-------------+----------+-----------+
+2 row(s)
+
+-- LEFT JOIN: all left rows, NULL where no match
+minidb> SELECT * FROM orders LEFT JOIN users ON orders.user_id = users.id;
+3 row(s)  -- ghost order appears with NULL user columns
+
 minidb> \tables
-minidb> \desc users
+minidb> \desc orders
 minidb> \quit
 ```
 
@@ -55,16 +77,22 @@ minidb> \quit
 
 ```bash
 # All tests
-go test ./tests/...
+go test ./tests/... -v
 
-# Specific test file
+# Specific feature tests
+go test ./tests/ -run TestFloat     # FLOAT type tests
+go test ./tests/ -run TestBool      # BOOL type tests
+go test ./tests/ -run TestJoin      # JOIN tests (general)
+go test ./tests/ -run TestEngineInnerJoin
+go test ./tests/ -run TestEngineLeftJoin
+go test ./tests/ -run TestParseInnerJoin
+go test ./tests/ -run TestParseLeftJoin
+
+# Legacy test suites
 go test ./tests/ -run TestBTree
 go test ./tests/ -run TestWAL
 go test ./tests/ -run TestParser
 go test ./tests/ -run TestEngine
-
-# With verbose output
-go test ./tests/ -v -run TestBTreeInsert1000
 
 # Benchmarks
 go test ./tests/ -bench=. -benchmem
@@ -119,6 +147,34 @@ If the process crashes mid-transaction:
               ↑─────────────────↑ linked list for range scans
 ```
 
+## Supported SQL Syntax
+
+```sql
+-- Data Definition
+CREATE TABLE name (col1 INT, col2 TEXT, col3 FLOAT, col4 BOOL);
+
+-- Data Manipulation
+INSERT INTO name VALUES (1, 'text', 3.14, TRUE);
+SELECT * FROM name [WHERE expr] [ORDER BY col [ASC|DESC]] [LIMIT n];
+SELECT col1, col2 FROM name;
+UPDATE name SET col = val [WHERE expr];
+DELETE FROM name [WHERE expr];
+
+-- JOIN queries
+SELECT * FROM left_table INNER JOIN right_table ON left_table.col = right_table.col;
+SELECT * FROM left_table LEFT JOIN right_table ON left_table.col = right_table.col;
+SELECT * FROM left_table JOIN right_table ON left_table.col = right_table.col;  -- defaults to INNER
+
+-- WHERE operators
+=  !=  <  >  <=  >=  AND  OR  NOT
+
+-- Data types
+INT    -- 64-bit signed integer
+TEXT   -- variable-length string
+FLOAT  -- 64-bit IEEE 754 double (literals: 3.14, -0.5)
+BOOL   -- boolean (literals: TRUE, FALSE)
+```
+
 ## Key Design Decisions
 
 | Decision | Choice | Why |
@@ -128,16 +184,48 @@ If the process crashes mid-transaction:
 | Cache policy | LRU | Simple, effective for most workloads |
 | Recovery | ARIES (simplified) | Industry standard for WAL-based recovery |
 | Parser | Recursive descent | Simple, readable, easy to extend |
-| Row storage | In-memory map + int64 key | Simplified for learning; real DB uses heap pages |
+| Row storage | In-memory cache + binary WAL encoding | Full type fidelity (INT/TEXT/FLOAT/BOOL) |
+| JOIN algorithm | Nested Loop Join | Simple O(n×m); sufficient for learning purposes |
 
 ## Extending MiniDB
 
 - **Composite keys**: modify `btree.Key` to be a `[]byte` or struct
 - **Heap files**: store full variable-length rows in separate pages
-- **JOIN support**: add `HashJoin` or `NestedLoopJoin` plan node
+- **Hash/Merge Join**: replace Nested Loop Join for better performance on large tables
 - **Transactions**: add a lock manager for isolation (currently no locking)
-- **FLOAT/BOOL types**: extend `DataType` enum and row codec
 - **Index on non-PK**: build a secondary B+ tree per indexed column
+- **DECIMAL type**: extend `DataType` with fixed-precision arithmetic
+
+## Changelog
+
+### v2.0 — JOIN + FLOAT/BOOL Types (2026-03-19)
+
+#### New Data Types
+| Type | Storage | Literals |
+|---|---|---|
+| `FLOAT` | 8-byte IEEE 754 (tag `2` in WAL) | `3.14`, `-0.5` |
+| `BOOL` | 1 byte (tag `3` in WAL) | `TRUE`, `FALSE` |
+
+#### New SQL Features
+- **`INNER JOIN`** — returns only rows with matching ON condition (Nested Loop Join)
+- **`LEFT JOIN`** — returns all left rows; unmatched right columns are `NULL`
+- **Bare `JOIN`** — defaults to `INNER JOIN`
+- **Qualified column references** — `table.column` syntax in SELECT lists and ON/WHERE clauses
+- **Float literals** — `3.14`, `-1.5` parsed as `float64`
+- **Boolean literals** — `TRUE` / `FALSE` parsed as `bool`
+
+#### Files Changed
+| File | Change |
+|---|---|
+| `internal/parser/lexer.go` | 10 new tokens: `FLOAT`, `BOOL`, `TRUE`, `FALSE`, `JOIN`, `ON`, `INNER`, `LEFT`, `FLOAT_LIT` |
+| `internal/parser/ast.go` | `DataTypeFloat`, `DataTypeBool`, `JoinClause`, `QualifiedRef` nodes |
+| `internal/parser/parser.go` | `parseDataType`, `parsePrimary`, `parseColumnList`, `parseSelect` extended |
+| `internal/engine/executor.go` | `PackRowBytes`/`UnpackRowBytes` for FLOAT/BOOL; `executeJoinSelect` (NLJ) |
+| `internal/engine/result.go` | `formatValue`, `valuesEqual`, `compareValues` for `float64`/`bool`; `qualifiedRefExpr` |
+| `tests/parser_test.go` | 6 new tests for new types and JOIN parsing |
+| `tests/engine_test.go` | 7 new integration tests for FLOAT/BOOL/JOIN execution |
+
+---
 
 ## References
 
