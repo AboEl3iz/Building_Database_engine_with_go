@@ -55,11 +55,22 @@ const (
 	TokenNOT
 	TokenINT    // INT data type keyword
 	TokenTEXT   // TEXT data type keyword
+	TokenFLOAT  // FLOAT data type keyword
+	TokenBOOL   // BOOL data type keyword
+	TokenTRUE   // TRUE literal
+	TokenFALSE  // FALSE literal
+
+	// ---- JOIN keywords ----
+	TokenJOIN  // JOIN
+	TokenON    // ON
+	TokenINNER // INNER
+	TokenLEFT  // LEFT
 
 	// ---- Literals ----
-	TokenIDENT   // identifier: table name, column name, etc. (e.g., "users", "age")
-	TokenINTLIT  // integer literal: 42, -7, 0
-	TokenSTRLIT  // string literal: 'Alice', 'hello world'
+	TokenIDENT    // identifier: table name, column name, etc. (e.g., "users", "age")
+	TokenINTLIT   // integer literal: 42, -7, 0
+	TokenFLOATLIT // float literal: 3.14, -0.5
+	TokenSTRLIT   // string literal: 'Alice', 'hello world'
 
 	// ---- Symbols ----
 	TokenSTAR      // *
@@ -88,8 +99,10 @@ var tokenTypeNames = map[TokenType]string{
 	TokenVALUES: "VALUES", TokenSET: "SET", TokenTABLE: "TABLE",
 	TokenORDER: "ORDER", TokenBY: "BY", TokenASC: "ASC", TokenDESC: "DESC",
 	TokenLIMIT: "LIMIT", TokenAND: "AND", TokenOR: "OR", TokenNOT: "NOT",
-	TokenINT: "INT", TokenTEXT: "TEXT",
-	TokenIDENT: "IDENT", TokenINTLIT: "INT_LIT", TokenSTRLIT: "STR_LIT",
+	TokenINT: "INT", TokenTEXT: "TEXT", TokenFLOAT: "FLOAT", TokenBOOL: "BOOL",
+	TokenTRUE: "TRUE", TokenFALSE: "FALSE",
+	TokenJOIN: "JOIN", TokenON: "ON", TokenINNER: "INNER", TokenLEFT: "LEFT",
+	TokenIDENT: "IDENT", TokenINTLIT: "INT_LIT", TokenFLOATLIT: "FLOAT_LIT", TokenSTRLIT: "STR_LIT",
 	TokenSTAR: "*", TokenEQ: "=", TokenNEQ: "!=", TokenLT: "<", TokenGT: ">",
 	TokenLTE: "<=", TokenGTE: ">=",
 	TokenLPAREN: "(", TokenRPAREN: ")", TokenCOMMA: ",", TokenSEMICOLON: ";", TokenDOT: ".",
@@ -112,7 +125,9 @@ var keywords = map[string]TokenType{
 	"VALUES": TokenVALUES, "SET": TokenSET, "TABLE": TokenTABLE,
 	"ORDER": TokenORDER, "BY": TokenBY, "ASC": TokenASC, "DESC": TokenDESC,
 	"LIMIT": TokenLIMIT, "AND": TokenAND, "OR": TokenOR, "NOT": TokenNOT,
-	"INT": TokenINT, "TEXT": TokenTEXT,
+	"INT": TokenINT, "TEXT": TokenTEXT, "FLOAT": TokenFLOAT, "BOOL": TokenBOOL,
+	"TRUE": TokenTRUE, "FALSE": TokenFALSE,
+	"JOIN": TokenJOIN, "ON": TokenON, "INNER": TokenINNER, "LEFT": TokenLEFT,
 }
 
 // Token is one atomic unit of the SQL input.
@@ -246,7 +261,7 @@ func (l *Lexer) nextToken() (Token, error) {
 
 	// ---- Numeric literals (and negative numbers) ----
 	if unicode.IsDigit(ch) || (ch == '-' && l.pos+1 < len(l.input) && unicode.IsDigit(l.input[l.pos+1])) {
-		return l.readIntLiteral(startLine, startCol)
+		return l.readNumericLiteral(startLine, startCol)
 	}
 
 	// ---- Identifiers and keywords ----
@@ -286,8 +301,9 @@ func (l *Lexer) readStringLiteral(line, col int) (Token, error) {
 	return Token{}, fmt.Errorf("lexer L%d:C%d: unterminated string literal", line, col)
 }
 
-// readIntLiteral reads an integer literal (possibly negative).
-func (l *Lexer) readIntLiteral(line, col int) (Token, error) {
+// readNumericLiteral reads an integer or float literal (possibly negative).
+// If a decimal point is found, it produces a TokenFLOATLIT; otherwise TokenINTLIT.
+func (l *Lexer) readNumericLiteral(line, col int) (Token, error) {
 	var sb strings.Builder
 	if l.input[l.pos] == '-' {
 		sb.WriteRune('-')
@@ -296,6 +312,17 @@ func (l *Lexer) readIntLiteral(line, col int) (Token, error) {
 	for l.pos < len(l.input) && unicode.IsDigit(l.input[l.pos]) {
 		sb.WriteRune(l.input[l.pos])
 		l.advance()
+	}
+	// Check for decimal point → float literal
+	if l.pos < len(l.input) && l.input[l.pos] == '.' &&
+		l.pos+1 < len(l.input) && unicode.IsDigit(l.input[l.pos+1]) {
+		sb.WriteRune('.')
+		l.advance()
+		for l.pos < len(l.input) && unicode.IsDigit(l.input[l.pos]) {
+			sb.WriteRune(l.input[l.pos])
+			l.advance()
+		}
+		return Token{TokenFLOATLIT, sb.String(), line, col}, nil
 	}
 	return Token{TokenINTLIT, sb.String(), line, col}, nil
 }

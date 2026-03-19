@@ -1,6 +1,9 @@
 package parser
 
-import "fmt"
+import (
+	"fmt"
+	"strconv"
+)
 
 // ---- AST (Abstract Syntax Tree) Node Definitions ----
 //
@@ -42,8 +45,10 @@ type Expr interface {
 type DataType int
 
 const (
-	DataTypeInt  DataType = iota // 64-bit integer
-	DataTypeText                 // variable-length string
+	DataTypeInt   DataType = iota // 64-bit integer
+	DataTypeText                  // variable-length string
+	DataTypeFloat                 // 64-bit IEEE 754 float
+	DataTypeBool                  // boolean (true/false)
 )
 
 func (dt DataType) String() string {
@@ -52,6 +57,10 @@ func (dt DataType) String() string {
 		return "INT"
 	case DataTypeText:
 		return "TEXT"
+	case DataTypeFloat:
+		return "FLOAT"
+	case DataTypeBool:
+		return "BOOL"
 	default:
 		return "UNKNOWN"
 	}
@@ -91,18 +100,29 @@ func (s *CreateTableStmt) String() string {
 	return fmt.Sprintf("CREATE TABLE %s (%s)", s.TableName, cols)
 }
 
-// SelectStmt represents: SELECT col1, col2 FROM table WHERE expr ORDER BY col LIMIT n
+// JoinClause represents a JOIN expression: [INNER|LEFT] JOIN table ON expr
+type JoinClause struct {
+	Type  string // "INNER" or "LEFT"
+	Table string // the right-hand table name
+	On    Expr   // the join condition
+}
+
+// SelectStmt represents: SELECT col1, col2 FROM table [JOIN ...] WHERE expr ORDER BY col LIMIT n
 type SelectStmt struct {
-	Columns []string // ["*"] for SELECT *, or specific column names
+	Columns []string  // ["*"] for SELECT *, or specific column names
 	Table   string
-	Where   Expr    // nil if no WHERE clause
-	OrderBy *OrderBy // nil if no ORDER BY
-	Limit   int     // 0 means no limit
+	Join    *JoinClause // nil if no JOIN
+	Where   Expr        // nil if no WHERE clause
+	OrderBy *OrderBy    // nil if no ORDER BY
+	Limit   int         // 0 means no limit
 }
 
 func (s *SelectStmt) statementNode() {}
 func (s *SelectStmt) String() string {
 	sql := fmt.Sprintf("SELECT %s FROM %s", joinStrings(s.Columns, ", "), s.Table)
+	if s.Join != nil {
+		sql += fmt.Sprintf(" %s JOIN %s ON %s", s.Join.Type, s.Join.Table, s.Join.On.String())
+	}
 	if s.Where != nil {
 		sql += " WHERE " + s.Where.String()
 	}
@@ -179,13 +199,15 @@ func (s *DeleteStmt) String() string {
 // Expression AST Nodes
 // ============================
 
-// Literal represents a constant value in SQL: 42, 'Alice', true
+// Literal represents a constant value in SQL: 42, 'Alice', 3.14, TRUE
 //
 // The Value field holds:
-//   - int64 for integer literals
-//   - string for string literals
+//   - int64   for integer literals
+//   - string  for string literals
+//   - float64 for float literals
+//   - bool    for TRUE/FALSE literals
 type Literal struct {
-	Value interface{} // int64 or string
+	Value interface{} // int64, string, float64, or bool
 }
 
 func (e *Literal) exprNode() {}
@@ -195,6 +217,13 @@ func (e *Literal) String() string {
 		return fmt.Sprintf("%d", v)
 	case string:
 		return fmt.Sprintf("'%s'", v)
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case bool:
+		if v {
+			return "TRUE"
+		}
+		return "FALSE"
 	default:
 		return fmt.Sprintf("%v", v)
 	}
@@ -209,6 +238,18 @@ type ColumnRef struct {
 func (e *ColumnRef) exprNode() {}
 func (e *ColumnRef) String() string {
 	return e.Name
+}
+
+// QualifiedRef represents a table-qualified column reference: table.column.
+// Example: in "ON orders.user_id = users.id", `orders.user_id` is a QualifiedRef.
+type QualifiedRef struct {
+	Table  string
+	Column string
+}
+
+func (e *QualifiedRef) exprNode() {}
+func (e *QualifiedRef) String() string {
+	return e.Table + "." + e.Column
 }
 
 // BinaryExpr represents a two-operand expression.
