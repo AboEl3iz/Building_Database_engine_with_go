@@ -387,3 +387,147 @@ func TestASTString(t *testing.T) {
 	}
 	// Just verify it doesn't panic and returns something non-empty
 }
+
+// TestParseFloatBoolColumns tests: CREATE TABLE t (id INT, price FLOAT, active BOOL)
+func TestParseFloatBoolColumns(t *testing.T) {
+	stmt, err := parser.ParseSQL("CREATE TABLE products (id INT, price FLOAT, active BOOL)")
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+	create, ok := stmt.(*parser.CreateTableStmt)
+	if !ok {
+		t.Fatalf("Expected *CreateTableStmt, got %T", stmt)
+	}
+	if len(create.Columns) != 3 {
+		t.Fatalf("Expected 3 columns, got %d", len(create.Columns))
+	}
+	expected := []struct {
+		name string
+		typ  parser.DataType
+	}{
+		{"id", parser.DataTypeInt},
+		{"price", parser.DataTypeFloat},
+		{"active", parser.DataTypeBool},
+	}
+	for i, exp := range expected {
+		if create.Columns[i].Name != exp.name {
+			t.Errorf("Column[%d] name: expected %q, got %q", i, exp.name, create.Columns[i].Name)
+		}
+		if create.Columns[i].Type != exp.typ {
+			t.Errorf("Column[%d] type: expected %v, got %v", i, exp.typ, create.Columns[i].Type)
+		}
+	}
+}
+
+// TestParseFloatLiteral tests: WHERE price > 3.14
+func TestParseFloatLiteral(t *testing.T) {
+	stmt, err := parser.ParseSQL("SELECT * FROM products WHERE price > 3.14")
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+	sel := stmt.(*parser.SelectStmt)
+	bin, ok := sel.Where.(*parser.BinaryExpr)
+	if !ok || bin.Op != ">" {
+		t.Fatalf("Expected BinaryExpr(>), got %T", sel.Where)
+	}
+	lit, ok := bin.Right.(*parser.Literal)
+	if !ok {
+		t.Fatalf("Expected Literal, got %T", bin.Right)
+	}
+	f, ok := lit.Value.(float64)
+	if !ok || f != 3.14 {
+		t.Errorf("Expected float64(3.14), got %T(%v)", lit.Value, lit.Value)
+	}
+}
+
+// TestParseTrueFalseLiterals tests: WHERE active = TRUE / FALSE
+func TestParseTrueFalseLiterals(t *testing.T) {
+	for _, tc := range []struct {
+		sql  string
+		want bool
+	}{
+		{"SELECT * FROM t WHERE active = TRUE", true},
+		{"SELECT * FROM t WHERE active = FALSE", false},
+	} {
+		stmt, err := parser.ParseSQL(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q) failed: %v", tc.sql, err)
+		}
+		sel := stmt.(*parser.SelectStmt)
+		bin := sel.Where.(*parser.BinaryExpr)
+		lit, ok := bin.Right.(*parser.Literal)
+		if !ok {
+			t.Fatalf("Expected Literal, got %T", bin.Right)
+		}
+		b, ok := lit.Value.(bool)
+		if !ok || b != tc.want {
+			t.Errorf("Expected bool(%v), got %T(%v)", tc.want, lit.Value, lit.Value)
+		}
+	}
+}
+
+// TestParseInnerJoin tests: SELECT * FROM orders INNER JOIN users ON orders.user_id = users.id
+func TestParseInnerJoin(t *testing.T) {
+	stmt, err := parser.ParseSQL(
+		"SELECT * FROM orders INNER JOIN users ON orders.user_id = users.id")
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+	sel := stmt.(*parser.SelectStmt)
+	if sel.Table != "orders" {
+		t.Errorf("Expected left table 'orders', got %q", sel.Table)
+	}
+	if sel.Join == nil {
+		t.Fatal("Expected JOIN clause, got nil")
+	}
+	if sel.Join.Type != "INNER" {
+		t.Errorf("Expected join type INNER, got %q", sel.Join.Type)
+	}
+	if sel.Join.Table != "users" {
+		t.Errorf("Expected right table 'users', got %q", sel.Join.Table)
+	}
+	bin, ok := sel.Join.On.(*parser.BinaryExpr)
+	if !ok || bin.Op != "=" {
+		t.Fatalf("Expected BinaryExpr(=) in ON clause, got %T", sel.Join.On)
+	}
+	left, ok := bin.Left.(*parser.QualifiedRef)
+	if !ok || left.Table != "orders" || left.Column != "user_id" {
+		t.Errorf("Expected orders.user_id, got %v", bin.Left)
+	}
+	right, ok := bin.Right.(*parser.QualifiedRef)
+	if !ok || right.Table != "users" || right.Column != "id" {
+		t.Errorf("Expected users.id, got %v", bin.Right)
+	}
+}
+
+// TestParseLeftJoin tests: SELECT * FROM orders LEFT JOIN users ON orders.user_id = users.id
+func TestParseLeftJoin(t *testing.T) {
+	stmt, err := parser.ParseSQL(
+		"SELECT * FROM orders LEFT JOIN users ON orders.user_id = users.id")
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+	sel := stmt.(*parser.SelectStmt)
+	if sel.Join == nil {
+		t.Fatal("Expected JOIN clause")
+	}
+	if sel.Join.Type != "LEFT" {
+		t.Errorf("Expected join type LEFT, got %q", sel.Join.Type)
+	}
+}
+
+// TestParseBareJoin tests bare JOIN defaults to INNER.
+func TestParseBareJoin(t *testing.T) {
+	stmt, err := parser.ParseSQL("SELECT * FROM a JOIN b ON a.id = b.a_id")
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+	sel := stmt.(*parser.SelectStmt)
+	if sel.Join == nil {
+		t.Fatal("Expected JOIN clause")
+	}
+	if sel.Join.Type != "INNER" {
+		t.Errorf("Expected bare JOIN to default to INNER, got %q", sel.Join.Type)
+	}
+}
+

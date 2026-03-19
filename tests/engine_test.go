@@ -371,3 +371,185 @@ func TestEngineMultipleTables(t *testing.T) {
 func itoa(n int64) string {
 	return fmt.Sprintf("%d", n)
 }
+
+// ---- FLOAT/BOOL Type Tests ----
+
+// TestEngineFloatInsertSelect tests inserting and selecting FLOAT values.
+func TestEngineFloatInsertSelect(t *testing.T) {
+	exec, cleanup := newTestEngine(t)
+	defer cleanup()
+
+	execSQL(t, exec, "CREATE TABLE prices (id INT, amount FLOAT)")
+	execSQL(t, exec, "INSERT INTO prices VALUES (1, 9.99)")
+	execSQL(t, exec, "INSERT INTO prices VALUES (2, 24.50)")
+	execSQL(t, exec, "INSERT INTO prices VALUES (3, 1.01)")
+
+	rs := execSQL(t, exec, "SELECT * FROM prices")
+	if rs.RowCount() != 3 {
+		t.Errorf("Expected 3 rows, got %d", rs.RowCount())
+	}
+
+	// Verify the float values are preserved correctly
+	for _, row := range rs.Rows {
+		amt, ok := row["amount"].(float64)
+		if !ok {
+			t.Errorf("Expected float64 for 'amount', got %T", row["amount"])
+		}
+		if amt <= 0 {
+			t.Errorf("Expected positive amount, got %v", amt)
+		}
+	}
+}
+
+// TestEngineFloatWhereFilter tests WHERE clause with FLOAT comparison.
+func TestEngineFloatWhereFilter(t *testing.T) {
+	exec, cleanup := newTestEngine(t)
+	defer cleanup()
+
+	execSQL(t, exec, "CREATE TABLE products (id INT, price FLOAT)")
+	execSQL(t, exec, "INSERT INTO products VALUES (1, 9.99)")
+	execSQL(t, exec, "INSERT INTO products VALUES (2, 49.99)")
+	execSQL(t, exec, "INSERT INTO products VALUES (3, 4.50)")
+	execSQL(t, exec, "INSERT INTO products VALUES (4, 19.95)")
+
+	rs := execSQL(t, exec, "SELECT * FROM products WHERE price > 10.0")
+	// Only id=2 (49.99) and id=4 (19.95) are > 10.0
+	if rs.RowCount() != 2 {
+		t.Errorf("Expected 2 rows with price > 10.0, got %d", rs.RowCount())
+	}
+}
+
+// TestEngineBoolInsertSelect tests inserting and selecting BOOL values.
+func TestEngineBoolInsertSelect(t *testing.T) {
+	exec, cleanup := newTestEngine(t)
+	defer cleanup()
+
+	execSQL(t, exec, "CREATE TABLE flags (id INT, active BOOL)")
+	execSQL(t, exec, "INSERT INTO flags VALUES (1, TRUE)")
+	execSQL(t, exec, "INSERT INTO flags VALUES (2, FALSE)")
+	execSQL(t, exec, "INSERT INTO flags VALUES (3, TRUE)")
+
+	rs := execSQL(t, exec, "SELECT * FROM flags")
+	if rs.RowCount() != 3 {
+		t.Errorf("Expected 3 rows, got %d", rs.RowCount())
+	}
+
+	// Verify bool type is preserved
+	for _, row := range rs.Rows {
+		_, ok := row["active"].(bool)
+		if !ok {
+			t.Errorf("Expected bool for 'active', got %T(%v)", row["active"], row["active"])
+		}
+	}
+}
+
+// TestEngineBoolWhereFilter tests WHERE active = TRUE filter.
+func TestEngineBoolWhereFilter(t *testing.T) {
+	exec, cleanup := newTestEngine(t)
+	defer cleanup()
+
+	execSQL(t, exec, "CREATE TABLE users (id INT, active BOOL)")
+	execSQL(t, exec, "INSERT INTO users VALUES (1, TRUE)")
+	execSQL(t, exec, "INSERT INTO users VALUES (2, FALSE)")
+	execSQL(t, exec, "INSERT INTO users VALUES (3, TRUE)")
+	execSQL(t, exec, "INSERT INTO users VALUES (4, FALSE)")
+
+	rs := execSQL(t, exec, "SELECT * FROM users WHERE active = TRUE")
+	if rs.RowCount() != 2 {
+		t.Errorf("Expected 2 active users, got %d", rs.RowCount())
+	}
+}
+
+// ---- JOIN Tests ----
+
+// TestEngineInnerJoin tests INNER JOIN returns only matching rows.
+func TestEngineInnerJoin(t *testing.T) {
+	exec, cleanup := newTestEngine(t)
+	defer cleanup()
+
+	// users: id, name
+	execSQL(t, exec, "CREATE TABLE users (id INT, name TEXT)")
+	execSQL(t, exec, "INSERT INTO users VALUES (1, 'Alice')")
+	execSQL(t, exec, "INSERT INTO users VALUES (2, 'Bob')")
+
+	// orders: id, user_id, item
+	execSQL(t, exec, "CREATE TABLE orders (id INT, user_id INT, item TEXT)")
+	execSQL(t, exec, "INSERT INTO orders VALUES (1, 1, 'book')")
+	execSQL(t, exec, "INSERT INTO orders VALUES (2, 1, 'pen')")
+	execSQL(t, exec, "INSERT INTO orders VALUES (3, 99, 'ghost')") // no matching user
+
+	rs := execSQL(t, exec,
+		"SELECT * FROM orders INNER JOIN users ON orders.user_id = users.id")
+
+	// Only orders 1 and 2 have a matching user (Alice, id=1)
+	if rs.RowCount() != 2 {
+		t.Errorf("INNER JOIN: expected 2 rows, got %d", rs.RowCount())
+	}
+
+	// Verify result columns include both table prefixes
+	for _, row := range rs.Rows {
+		if row["orders.item"] == nil {
+			t.Error("Expected 'orders.item' in JOIN result")
+		}
+		if row["users.name"] == nil {
+			t.Error("Expected 'users.name' in JOIN result")
+		}
+	}
+}
+
+// TestEngineLeftJoin tests LEFT JOIN includes all left rows, NULLs for unmatched right.
+func TestEngineLeftJoin(t *testing.T) {
+	exec, cleanup := newTestEngine(t)
+	defer cleanup()
+
+	execSQL(t, exec, "CREATE TABLE users (id INT, name TEXT)")
+	execSQL(t, exec, "INSERT INTO users VALUES (1, 'Alice')")
+	execSQL(t, exec, "INSERT INTO users VALUES (2, 'Bob')")
+
+	execSQL(t, exec, "CREATE TABLE orders (id INT, user_id INT, item TEXT)")
+	execSQL(t, exec, "INSERT INTO orders VALUES (1, 1, 'book')")
+	execSQL(t, exec, "INSERT INTO orders VALUES (2, 99, 'ghost')") // no matching user
+
+	rs := execSQL(t, exec,
+		"SELECT * FROM orders LEFT JOIN users ON orders.user_id = users.id")
+
+	// LEFT JOIN: both orders appear — ghost order has NULL for user columns
+	if rs.RowCount() != 2 {
+		t.Errorf("LEFT JOIN: expected 2 rows (including unmatched), got %d", rs.RowCount())
+	}
+
+	// Find the unmatched row (ghost) and verify its user columns are NULL
+	nullFound := false
+	for _, row := range rs.Rows {
+		if row["orders.item"] == "ghost" {
+			if row["users.name"] != nil {
+				t.Errorf("Expected NULL for users.name on unmatched LEFT JOIN row, got %v",
+					row["users.name"])
+			}
+			nullFound = true
+		}
+	}
+	if !nullFound {
+		t.Error("Could not find the unmatched 'ghost' order row in LEFT JOIN result")
+	}
+}
+
+// TestEngineInnerJoinNoMatches tests INNER JOIN with zero matching rows returns empty.
+func TestEngineInnerJoinNoMatches(t *testing.T) {
+	exec, cleanup := newTestEngine(t)
+	defer cleanup()
+
+	execSQL(t, exec, "CREATE TABLE left_t (id INT, val INT)")
+	execSQL(t, exec, "INSERT INTO left_t VALUES (1, 10)")
+
+	execSQL(t, exec, "CREATE TABLE right_t (id INT, val INT)")
+	execSQL(t, exec, "INSERT INTO right_t VALUES (99, 20)")
+
+	rs := execSQL(t, exec,
+		"SELECT * FROM left_t INNER JOIN right_t ON left_t.id = right_t.id")
+
+	if rs.RowCount() != 0 {
+		t.Errorf("INNER JOIN with no matches: expected 0 rows, got %d", rs.RowCount())
+	}
+}
+
