@@ -19,8 +19,10 @@ package engine
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
+
 
 // Value is any scalar value a column can hold.
 // We use interface{} to support both int64 and string.
@@ -149,6 +151,13 @@ func formatValue(v Value) string {
 	switch val := v.(type) {
 	case int64:
 		return fmt.Sprintf("%d", val)
+	case float64:
+		return strconv.FormatFloat(val, 'f', -1, 64)
+	case bool:
+		if val {
+			return "true"
+		}
+		return "false"
 	case string:
 		return val
 	default:
@@ -167,7 +176,7 @@ func formatValue(v Value) string {
 //   Result: true (30 > 25)
 
 // EvalExpr evaluates an AST expression against a row.
-// Returns the result value (int64, string, or bool).
+// Returns the result value (int64, string, float64, or bool).
 func EvalExpr(expr interface{}, row Row) (Value, error) {
 	// We import parser types by name to avoid circular dependency.
 	// In a larger project, expressions would be in their own package.
@@ -179,6 +188,14 @@ func EvalExpr(expr interface{}, row Row) (Value, error) {
 	case *columnRefExpr:
 		val := row.Get(e.name)
 		return val, nil
+
+	case *qualifiedRefExpr:
+		// Try "table.col" first (used in JOIN results), fall back to plain "col"
+		key := e.table + "." + e.col
+		if val, ok := row[key]; ok {
+			return val, nil
+		}
+		return row.Get(e.col), nil
 
 	case *binaryExpr:
 		left, err := EvalExpr(e.left, row)
@@ -251,19 +268,30 @@ func applyUnaryOp(op string, operand Value) (Value, error) {
 }
 
 // valuesEqual compares two values for equality.
-// int64 vs int64 → numeric comparison
-// string vs string → string comparison
-// other combinations → false
 func valuesEqual(a, b Value) bool {
 	if a == nil && b == nil {
 		return true
 	}
 	switch av := a.(type) {
 	case int64:
-		bv, ok := b.(int64)
-		return ok && av == bv
+		switch bv := b.(type) {
+		case int64:
+			return av == bv
+		case float64:
+			return float64(av) == bv
+		}
+	case float64:
+		switch bv := b.(type) {
+		case float64:
+			return av == bv
+		case int64:
+			return av == float64(bv)
+		}
 	case string:
 		bv, ok := b.(string)
+		return ok && av == bv
+	case bool:
+		bv, ok := b.(bool)
 		return ok && av == bv
 	}
 	return false
@@ -271,9 +299,30 @@ func valuesEqual(a, b Value) bool {
 
 // compareValues returns -1, 0, or +1 for ordering comparisons.
 func compareValues(a, b Value) int {
+	toFloat := func(v Value) (float64, bool) {
+		switch x := v.(type) {
+		case int64:
+			return float64(x), true
+		case float64:
+			return x, true
+		}
+		return 0, false
+	}
+
+	fa, aIsNum := toFloat(a)
+	fb, bIsNum := toFloat(b)
+	if aIsNum && bIsNum {
+		if fa < fb {
+			return -1
+		} else if fa > fb {
+			return 1
+		}
+		return 0
+	}
+
 	switch av := a.(type) {
-	case int64:
-		if bv, ok := b.(int64); ok {
+	case string:
+		if bv, ok := b.(string); ok {
 			if av < bv {
 				return -1
 			} else if av > bv {
@@ -281,11 +330,12 @@ func compareValues(a, b Value) int {
 			}
 			return 0
 		}
-	case string:
-		if bv, ok := b.(string); ok {
-			if av < bv {
+	case bool:
+		if bv, ok := b.(bool); ok {
+			// false < true
+			if !av && bv {
 				return -1
-			} else if av > bv {
+			} else if av && !bv {
 				return 1
 			}
 			return 0
@@ -299,6 +349,7 @@ func compareValues(a, b Value) int {
 
 type literalExpr struct{ value Value }
 type columnRefExpr struct{ name string }
+type qualifiedRefExpr struct{ table, col string }
 type binaryExpr struct {
 	left, right interface{}
 	op          string

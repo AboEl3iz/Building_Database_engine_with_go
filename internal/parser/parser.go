@@ -5,6 +5,7 @@ import (
 	"strconv"
 )
 
+
 // Parser is a recursive descent parser for MiniDB's SQL subset.
 //
 // CONCEPT: Recursive Descent Parsing
@@ -105,6 +106,7 @@ func (p *Parser) parseStatement() (Statement, error) {
 // ---- SELECT ----
 // Grammar: SELECT (* | col, ...) FROM table [WHERE expr] [ORDER BY col [ASC|DESC]] [LIMIT n]
 
+// parseSelect parses: SELECT (* | col, ...) FROM table [[INNER|LEFT] JOIN table ON expr] [WHERE expr] [ORDER BY col [ASC|DESC]] [LIMIT n]
 func (p *Parser) parseSelect() (*SelectStmt, error) {
 	if err := p.expect(TokenSELECT); err != nil {
 		return nil, err
@@ -112,7 +114,7 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 
 	stmt := &SelectStmt{}
 
-	// Parse column list: * or col1, col2, ...
+	// Parse column list: * or col1, col2, col1.col, ...
 	columns, err := p.parseColumnList()
 	if err != nil {
 		return nil, err
@@ -128,6 +130,34 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 		return nil, fmt.Errorf("parser: expected table name after FROM: %w", err)
 	}
 	stmt.Table = tableName
+
+	// Optional: [INNER|LEFT] JOIN table ON expr
+	joinType := ""
+	if p.peek().Type == TokenINNER {
+		p.consume() // eat INNER
+		joinType = "INNER"
+	} else if p.peek().Type == TokenLEFT {
+		p.consume() // eat LEFT
+		joinType = "LEFT"
+	}
+	if p.peek().Type == TokenJOIN {
+		p.consume() // eat JOIN
+		if joinType == "" {
+			joinType = "INNER" // bare JOIN defaults to INNER
+		}
+		rightTable, err := p.expectIdent()
+		if err != nil {
+			return nil, fmt.Errorf("parser: expected table name after JOIN: %w", err)
+		}
+		if err := p.expect(TokenON); err != nil {
+			return nil, err
+		}
+		onExpr, err := p.parseExpr()
+		if err != nil {
+			return nil, fmt.Errorf("parser: invalid JOIN ON clause: %w", err)
+		}
+		stmt.Join = &JoinClause{Type: joinType, Table: rightTable, On: onExpr}
+	}
 
 	// Optional: WHERE expr
 	if p.peek().Type == TokenWHERE {
@@ -172,8 +202,9 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 	return stmt, nil
 }
 
+
 // parseColumnList parses the column list in SELECT.
-// Returns ["*"] for SELECT *, or individual column names.
+// Returns ["*"] for SELECT *, or individual column names (possibly "table.col" qualified).
 func (p *Parser) parseColumnList() ([]string, error) {
 	if p.peek().Type == TokenSTAR {
 		p.consume()
@@ -185,6 +216,15 @@ func (p *Parser) parseColumnList() ([]string, error) {
 		col, err := p.expectIdent()
 		if err != nil {
 			return nil, fmt.Errorf("parser: expected column name: %w", err)
+		}
+		// Support qualified table.column references in the SELECT list
+		if p.peek().Type == TokenDOT {
+			p.consume() // eat dot
+			colName, err := p.expectIdent()
+			if err != nil {
+				return nil, fmt.Errorf("parser: expected column after '.' in SELECT list: %w", err)
+			}
+			col = col + "." + colName
 		}
 		cols = append(cols, col)
 
@@ -199,6 +239,7 @@ func (p *Parser) parseColumnList() ([]string, error) {
 	}
 	return cols, nil
 }
+
 
 // ---- INSERT ----
 // Grammar: INSERT INTO table VALUES (expr, expr, ...)
@@ -387,10 +428,17 @@ func (p *Parser) parseDataType() (DataType, error) {
 	case TokenTEXT:
 		p.consume()
 		return DataTypeText, nil
+	case TokenFLOAT:
+		p.consume()
+		return DataTypeFloat, nil
+	case TokenBOOL:
+		p.consume()
+		return DataTypeBool, nil
 	default:
-		return 0, fmt.Errorf("parser: expected INT or TEXT, got %q at L%d:C%d", tok.Literal, tok.Line, tok.Col)
+		return 0, fmt.Errorf("parser: expected INT, TEXT, FLOAT, or BOOL, got %q at L%d:C%d", tok.Literal, tok.Line, tok.Col)
 	}
 }
+
 
 // ---- Expression Parsing ----
 //
@@ -493,8 +541,11 @@ func (p *Parser) parseComparison() (Expr, error) {
 
 // parsePrimary parses the most basic expression units:
 // - integer literal: 42
+// - float literal: 3.14
+// - boolean literal: TRUE, FALSE
 // - string literal: 'Alice'
-// - column reference: age, name, id
+// - qualified column reference: table.column
+// - plain column reference: age, name, id
 // - parenthesized expression: (expr)
 func (p *Parser) parsePrimary() (Expr, error) {
 	tok := p.peek()
@@ -508,12 +559,37 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		}
 		return &Literal{Value: n}, nil
 
+	case TokenFLOATLIT:
+		p.consume()
+		f, err := strconv.ParseFloat(tok.Literal, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parser: invalid float %q: %w", tok.Literal, err)
+		}
+		return &Literal{Value: f}, nil
+
+	case TokenTRUE:
+		p.consume()
+		return &Literal{Value: true}, nil
+
+	case TokenFALSE:
+		p.consume()
+		return &Literal{Value: false}, nil
+
 	case TokenSTRLIT:
 		p.consume()
 		return &Literal{Value: tok.Literal}, nil
 
 	case TokenIDENT:
 		p.consume()
+		// Check for qualified table.column reference
+		if p.peek().Type == TokenDOT {
+			p.consume() // eat dot
+			colName, err := p.expectIdent()
+			if err != nil {
+				return nil, fmt.Errorf("parser: expected column name after '.': %w", err)
+			}
+			return &QualifiedRef{Table: tok.Literal, Column: colName}, nil
+		}
 		return &ColumnRef{Name: tok.Literal}, nil
 
 	case TokenLPAREN:
@@ -532,6 +608,7 @@ func (p *Parser) parsePrimary() (Expr, error) {
 			tok.Literal, tok.Type, tok.Line, tok.Col)
 	}
 }
+
 
 // ---- Token navigation helpers ----
 

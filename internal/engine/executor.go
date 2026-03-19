@@ -51,6 +51,9 @@ func (e *Executor) Execute(stmt parser.Statement) (*ResultSet, error) {
 	case *parser.InsertStmt:
 		return e.executeInsert(s)
 	case *parser.SelectStmt:
+		if s.Join != nil {
+			return e.executeJoinSelect(s)
+		}
 		return e.executeSelect(s)
 	case *parser.UpdateStmt:
 		return e.executeUpdate(s)
@@ -385,6 +388,8 @@ func convertExpr(e parser.Expr) interface{} {
 		return &literalExpr{value: expr.Value}
 	case *parser.ColumnRef:
 		return &columnRefExpr{name: expr.Name}
+	case *parser.QualifiedRef:
+		return &qualifiedRefExpr{table: expr.Table, col: expr.Column}
 	case *parser.BinaryExpr:
 		return &binaryExpr{
 			left:  convertExpr(expr.Left),
@@ -409,18 +414,25 @@ func evalLiteral(expr parser.Expr) (Value, error) {
 	return lit.Value, nil
 }
 
-// extractPrimaryKey finds the primary key value (first INT column) from a row.
+// extractPrimaryKey finds the primary key value (first INT or FLOAT column) from a row.
 func extractPrimaryKey(schema *catalog.TableSchema, row Row) (int64, error) {
 	for _, col := range schema.Columns {
-		if col.Type == parser.DataTypeInt {
+		switch col.Type {
+		case parser.DataTypeInt:
 			val, ok := row[col.Name].(int64)
 			if !ok {
 				return 0, fmt.Errorf("executor: primary key column %q is not an integer", col.Name)
 			}
 			return val, nil
+		case parser.DataTypeFloat:
+			val, ok := row[col.Name].(float64)
+			if !ok {
+				return 0, fmt.Errorf("executor: primary key column %q is not a float", col.Name)
+			}
+			return int64(val * 1e6), nil // scale to preserve some decimal precision
 		}
 	}
-	return 0, fmt.Errorf("executor: table has no INT primary key column")
+	return 0, fmt.Errorf("executor: table has no INT or FLOAT primary key column")
 }
 
 // extractIndexScanKey checks if the WHERE clause is a simple `pkCol = value`
@@ -490,8 +502,6 @@ func resolveColumns(cols []string, schema *catalog.TableSchema) []string {
 // encodeRow packs a row into an int64 for B+ tree storage.
 // NOTE: This is a simplification — a real DB would store rows in heap pages.
 func encodeRow(schema *catalog.TableSchema, row Row) int64 {
-	// Pack up to 8 bytes from the row into an int64
-	// For a real implementation, rows would be stored in separate pages
 	var encoded int64
 	for i, col := range schema.Columns {
 		if i >= 8 { // we only support 8 columns in this simplified encoding
@@ -500,10 +510,15 @@ func encodeRow(schema *catalog.TableSchema, row Row) int64 {
 		val := row[col.Name]
 		switch v := val.(type) {
 		case int64:
-			// XOR-fold with position shift to avoid collision
 			encoded ^= v << (uint(i) * 7 % 56)
+		case float64:
+			// Treat float bits as int64 for XOR encoding
+			encoded ^= int64(math.Float64bits(v)) << (uint(i) * 7 % 56)
+		case bool:
+			if v {
+				encoded ^= int64(1) << (uint(i) * 7 % 56)
+			}
 		case string:
-			// Simple polynomial hash of the string
 			hash := int64(0)
 			for j, c := range v {
 				hash = hash*31 + int64(c)*int64(j+1)
@@ -557,7 +572,8 @@ func storeRowInCache(schema *catalog.TableSchema, row Row, encoded int64) {
 }
 
 // PackRowBytes encodes a row as a proper binary byte slice for persistence.
-// Format: [numCols(2B)] [col1_type(1B) col1_len(2B) col1_data...] ...
+// Format: [col1_type(1B) col1_data...] [col2_type(1B) col2_data...] ...
+// Type tags: 0=INT (8B), 1=TEXT (2B len + data), 2=FLOAT (8B), 3=BOOL (1B)
 // This is used for WAL records that need to be durable.
 func PackRowBytes(schema *catalog.TableSchema, row Row) []byte {
 	var parts [][]byte
@@ -582,12 +598,26 @@ func PackRowBytes(schema *catalog.TableSchema, row Row) []byte {
 			binary.LittleEndian.PutUint16(b[1:], uint16(len(sBytes)))
 			copy(b[3:], sBytes)
 			colBytes = b
+
+		case parser.DataTypeFloat:
+			b := make([]byte, 9) // type(1) + value(8)
+			b[0] = 2             // FLOAT type tag
+			v, _ := val.(float64)
+			binary.LittleEndian.PutUint64(b[1:], math.Float64bits(v))
+			colBytes = b
+
+		case parser.DataTypeBool:
+			b := make([]byte, 2) // type(1) + value(1)
+			b[0] = 3             // BOOL type tag
+			if v, _ := val.(bool); v {
+				b[1] = 1
+			}
+			colBytes = b
 		}
 
 		parts = append(parts, colBytes)
 	}
 
-	// Flatten all parts into one slice
 	var result []byte
 	for _, p := range parts {
 		result = append(result, p...)
@@ -629,6 +659,21 @@ func UnpackRowBytes(schema *catalog.TableSchema, data []byte) (Row, error) {
 			row[col.Name] = string(data[offset : offset+strLen])
 			offset += strLen
 
+		case 2: // FLOAT
+			if offset+8 > len(data) {
+				return nil, fmt.Errorf("executor: not enough bytes for FLOAT column %q", col.Name)
+			}
+			bits := binary.LittleEndian.Uint64(data[offset:])
+			row[col.Name] = math.Float64frombits(bits)
+			offset += 8
+
+		case 3: // BOOL
+			if offset+1 > len(data) {
+				return nil, fmt.Errorf("executor: not enough bytes for BOOL column %q", col.Name)
+			}
+			row[col.Name] = data[offset] != 0
+			offset++
+
 		default:
 			return nil, fmt.Errorf("executor: unknown type tag %d for column %q", typeTag, col.Name)
 		}
@@ -666,4 +711,152 @@ func (e *Executor) DescribeTable(tableName string) (string, error) {
 		sb.WriteString(fmt.Sprintf("  [%d] %s %s\n", i, col.Name, col.Type))
 	}
 	return sb.String(), nil
+}
+
+// ---- JOIN ----
+
+// executeJoinSelect executes a SELECT with a JOIN clause using a Nested Loop Join.
+//
+// Algorithm:
+//  1. SeqScan the left (base) table → leftRows
+//  2. SeqScan the right (joined) table → rightRows
+//  3. For each leftRow × each rightRow:
+//     a. Merge into a combined row with "table.col" qualified keys
+//     b. Evaluate the ON condition
+//     c. If it matches, append to result
+//  4. For LEFT JOIN: also emit non-matched left rows with NULLs for right columns
+//
+// Performance: O(n × m) — fine for small tables. A real DB would use a HashJoin.
+func (e *Executor) executeJoinSelect(stmt *parser.SelectStmt) (*ResultSet, error) {
+	// Fetch left table
+	leftSchema, err := e.cat.GetTable(stmt.Table)
+	if err != nil {
+		return nil, err
+	}
+	leftTree, err := e.getTree(stmt.Table, leftSchema)
+	if err != nil {
+		return nil, err
+	}
+	leftScan, err := btree.Scan(e.bp, leftTree.RootPageID(), 0, math.MaxInt64)
+	if err != nil {
+		return nil, fmt.Errorf("executor: JOIN left table scan failed: %w", err)
+	}
+
+	// Fetch right table
+	rightSchema, err := e.cat.GetTable(stmt.Join.Table)
+	if err != nil {
+		return nil, err
+	}
+	rightTree, err := e.getTree(stmt.Join.Table, rightSchema)
+	if err != nil {
+		return nil, err
+	}
+	rightScan, err := btree.Scan(e.bp, rightTree.RootPageID(), 0, math.MaxInt64)
+	if err != nil {
+		return nil, fmt.Errorf("executor: JOIN right table scan failed: %w", err)
+	}
+
+	// Decode all rows from both sides, storing them with qualified "table.col" keys
+	var leftRows []Row
+	for _, sr := range leftScan {
+		raw := decodeRow(leftSchema, sr.Value)
+		qRow := make(Row)
+		for _, col := range leftSchema.Columns {
+			qRow[stmt.Table+"."+col.Name] = raw[col.Name]
+			qRow[col.Name] = raw[col.Name] // also plain name for convenience
+		}
+		leftRows = append(leftRows, qRow)
+	}
+
+	var rightRows []Row
+	for _, sr := range rightScan {
+		raw := decodeRow(rightSchema, sr.Value)
+		qRow := make(Row)
+		for _, col := range rightSchema.Columns {
+			qRow[stmt.Join.Table+"."+col.Name] = raw[col.Name]
+			qRow[col.Name] = raw[col.Name]
+		}
+		rightRows = append(rightRows, qRow)
+	}
+
+	// Nested loop join
+	var joinedRows []Row
+	for _, left := range leftRows {
+		matched := false
+		for _, right := range rightRows {
+			// Build merged row
+			merged := make(Row)
+			for k, v := range left {
+				merged[k] = v
+			}
+			for k, v := range right {
+				merged[k] = v
+			}
+			// Evaluate ON condition
+			if e.evalWhere(stmt.Join.On, merged) {
+				// Apply optional WHERE filter on the merged row
+				if e.evalWhere(stmt.Where, merged) {
+					joinedRows = append(joinedRows, merged)
+				}
+				matched = true
+			}
+		}
+		// LEFT JOIN: emit non-matching left rows with NULLs for right columns
+		if !matched && stmt.Join.Type == "LEFT" {
+			merged := make(Row)
+			for k, v := range left {
+				merged[k] = v
+			}
+			for _, col := range rightSchema.Columns {
+				merged[stmt.Join.Table+"."+col.Name] = nil
+				merged[col.Name] = nil
+			}
+			if e.evalWhere(stmt.Where, merged) {
+				joinedRows = append(joinedRows, merged)
+			}
+		}
+	}
+
+	// ORDER BY
+	if stmt.OrderBy != nil {
+		col := stmt.OrderBy.Column
+		asc := stmt.OrderBy.Asc
+		sort.Slice(joinedRows, func(i, j int) bool {
+			a := joinedRows[i].Get(col)
+			b := joinedRows[j].Get(col)
+			cmp := compareValues(a, b)
+			if asc {
+				return cmp < 0
+			}
+			return cmp > 0
+		})
+	}
+
+	// LIMIT
+	if stmt.Limit > 0 && len(joinedRows) > stmt.Limit {
+		joinedRows = joinedRows[:stmt.Limit]
+	}
+
+	// Projection: resolve output columns ("*" → all columns from both tables)
+	var outputCols []string
+	if len(stmt.Columns) == 1 && stmt.Columns[0] == "*" {
+		for _, col := range leftSchema.Columns {
+			outputCols = append(outputCols, stmt.Table+"."+col.Name)
+		}
+		for _, col := range rightSchema.Columns {
+			outputCols = append(outputCols, stmt.Join.Table+"."+col.Name)
+		}
+	} else {
+		outputCols = stmt.Columns
+	}
+
+	rs := NewResultSet(outputCols)
+	for _, row := range joinedRows {
+		projected := make(Row)
+		for _, col := range outputCols {
+			projected[col] = row.Get(col)
+		}
+		rs.AddRow(projected)
+	}
+	return rs, nil
 }
