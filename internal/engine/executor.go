@@ -8,6 +8,7 @@ import (
 	"minidb/internal/buffer"
 	"minidb/internal/catalog"
 	"minidb/internal/parser"
+	"minidb/internal/txn"
 	"minidb/internal/wal"
 	"sort"
 	"strings"
@@ -29,15 +30,23 @@ type Executor struct {
 	bp    *buffer.BufferPool
 	cat   *catalog.Catalog
 	wal   *wal.WAL
+	txm   *txn.TxManager      // session-level transaction manager
 	trees map[string]*btree.BTree // table name → B+ tree
 }
 
 // NewExecutor creates an Executor with the given dependencies.
-func NewExecutor(bp *buffer.BufferPool, cat *catalog.Catalog, w *wal.WAL) *Executor {
+func NewExecutor(bp *buffer.BufferPool, cat *catalog.Catalog, w *wal.WAL, txm ...*txn.TxManager) *Executor {
+	var tm *txn.TxManager
+	if len(txm) > 0 && txm[0] != nil {
+		tm = txm[0]
+	} else {
+		tm = txn.NewTxManager(w) // default: create one automatically
+	}
 	return &Executor{
 		bp:    bp,
 		cat:   cat,
 		wal:   w,
+		txm:   tm,
 		trees: make(map[string]*btree.BTree),
 	}
 }
@@ -59,9 +68,53 @@ func (e *Executor) Execute(stmt parser.Statement) (*ResultSet, error) {
 		return e.executeUpdate(s)
 	case *parser.DeleteStmt:
 		return e.executeDelete(s)
+
+	// ---- Transaction control ----
+	case *parser.BeginStmt:
+		return e.executeBegin()
+	case *parser.CommitStmt:
+		return e.executeCommit()
+	case *parser.RollbackStmt:
+		return e.executeRollback()
+
 	default:
 		return nil, fmt.Errorf("executor: unsupported statement type %T", stmt)
 	}
+}
+
+// ---- Transaction control helpers ----
+
+func (e *Executor) executeBegin() (*ResultSet, error) {
+	if err := e.txm.Begin(); err != nil {
+		return nil, err
+	}
+	rs := NewResultSet([]string{"result"})
+	rs.AddRow(Row{"result": "transaction started"})
+	return rs, nil
+}
+
+func (e *Executor) executeCommit() (*ResultSet, error) {
+	if err := e.txm.Commit(); err != nil {
+		return nil, err
+	}
+	rs := NewResultSet([]string{"result"})
+	rs.AddRow(Row{"result": "transaction committed"})
+	return rs, nil
+}
+
+func (e *Executor) executeRollback() (*ResultSet, error) {
+	if err := e.txm.Rollback(); err != nil {
+		return nil, err
+	}
+	rs := NewResultSet([]string{"result"})
+	rs.AddRow(Row{"result": "transaction rolled back"})
+	return rs, nil
+}
+
+// IsInTransaction reports whether a user transaction is currently open.
+// Used by the REPL to show a different prompt.
+func (e *Executor) IsInTransaction() bool {
+	return e.txm.IsActive()
 }
 
 // ---- CREATE TABLE ----
@@ -142,32 +195,39 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*ResultSet, error) {
 		return nil, fmt.Errorf("executor: row encoding failed: %w", err)
 	}
 
-	// WAL: log the insert before modifying the tree
-	txID, err := e.wal.Begin()
-	if err != nil {
-		return nil, fmt.Errorf("executor: WAL begin failed: %w", err)
-	}
-
-	_, err = e.wal.LogInsert(txID, schema.RootPageID, pk, rowEncoded)
-	if err != nil {
-		return nil, fmt.Errorf("executor: WAL log failed: %w", err)
-	}
-
 	// Get (or rebuild) the B+ tree for this table
 	tree, err := e.getTree(stmt.Table, schema)
 	if err != nil {
 		return nil, err
 	}
 
-	// Insert into B+ tree
-	if err := tree.Insert(pk, rowEncoded); err != nil {
-		e.wal.Abort(txID, tree)
-		return nil, fmt.Errorf("executor: insert failed: %w", err)
-	}
-
-	// Commit the transaction
-	if err := e.wal.Commit(txID); err != nil {
-		return nil, fmt.Errorf("executor: WAL commit failed: %w", err)
+	if e.txm.IsActive() {
+		// ---- Explicit transaction mode ----
+		// Log to WAL under the shared transaction ID.
+		if _, err = e.wal.LogInsert(e.txm.ActiveTxID(), schema.RootPageID, pk, rowEncoded); err != nil {
+			return nil, fmt.Errorf("executor: WAL log failed: %w", err)
+		}
+		if err := tree.Insert(pk, rowEncoded); err != nil {
+			return nil, fmt.Errorf("executor: insert failed: %w", err)
+		}
+		// Register undo op so ROLLBACK can reverse this insert.
+		e.txm.RecordInsert(tree, pk)
+	} else {
+		// ---- Auto-commit mode (backward compatible) ----
+		txID, err := e.wal.Begin()
+		if err != nil {
+			return nil, fmt.Errorf("executor: WAL begin failed: %w", err)
+		}
+		if _, err = e.wal.LogInsert(txID, schema.RootPageID, pk, rowEncoded); err != nil {
+			return nil, fmt.Errorf("executor: WAL log failed: %w", err)
+		}
+		if err := tree.Insert(pk, rowEncoded); err != nil {
+			e.wal.Abort(txID, tree)
+			return nil, fmt.Errorf("executor: insert failed: %w", err)
+		}
+		if err := e.wal.Commit(txID); err != nil {
+			return nil, fmt.Errorf("executor: WAL commit failed: %w", err)
+		}
 	}
 
 	// If the root page changed (due to a split), update the catalog
@@ -298,16 +358,22 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*ResultSet, error) {
 		}
 
 		newEncoded := encodeRow(schema, row)
+		storeRowInCache(schema, row, newEncoded)
 
-		// WAL: log the update
-		txID, _ := e.wal.Begin()
-		e.wal.LogUpdate(txID, schema.RootPageID, pk, oldEncoded, newEncoded)
-
-		// Update: delete old, insert new (B+ trees don't have in-place update)
-		tree.Delete(pk)
-		tree.Insert(pk, newEncoded)
-
-		e.wal.Commit(txID)
+		if e.txm.IsActive() {
+			// ---- Explicit transaction mode ----
+			e.wal.LogUpdate(e.txm.ActiveTxID(), schema.RootPageID, pk, oldEncoded, newEncoded)
+			e.txm.RecordUpdate(tree, pk, oldEncoded) // save for potential rollback
+			tree.Delete(pk)
+			tree.Insert(pk, newEncoded)
+		} else {
+			// ---- Auto-commit mode ----
+			txID, _ := e.wal.Begin()
+			e.wal.LogUpdate(txID, schema.RootPageID, pk, oldEncoded, newEncoded)
+			tree.Delete(pk)
+			tree.Insert(pk, newEncoded)
+			e.wal.Commit(txID)
+		}
 		updateCount++
 	}
 
@@ -342,10 +408,20 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*ResultSet, error) {
 		}
 
 		pk := sr.Key
-		txID, _ := e.wal.Begin()
-		e.wal.LogDelete(txID, schema.RootPageID, pk, sr.Value)
-		tree.Delete(pk)
-		e.wal.Commit(txID)
+		oldEncoded := sr.Value
+
+		if e.txm.IsActive() {
+			// ---- Explicit transaction mode ----
+			e.wal.LogDelete(e.txm.ActiveTxID(), schema.RootPageID, pk, oldEncoded)
+			e.txm.RecordDelete(tree, pk, oldEncoded) // save for potential rollback
+			tree.Delete(pk)
+		} else {
+			// ---- Auto-commit mode ----
+			txID, _ := e.wal.Begin()
+			e.wal.LogDelete(txID, schema.RootPageID, pk, oldEncoded)
+			tree.Delete(pk)
+			e.wal.Commit(txID)
+		}
 		deleteCount++
 	}
 
