@@ -111,9 +111,14 @@ func runREPL(exec *engine.Executor, cat *catalog.Catalog, bp *buffer.BufferPool)
 	var inputBuffer strings.Builder // accumulates multi-line SQL
 
 	for {
-		// Prompt changes when we're in the middle of a multi-line statement
+		// Prompt changes when we're in the middle of a multi-line statement,
+		// or when inside an explicit transaction.
 		if inputBuffer.Len() == 0 {
-			fmt.Print("minidb> ")
+			if exec.IsInTransaction() {
+				fmt.Print("minidb(txn)> ")
+			} else {
+				fmt.Print("minidb> ")
+			}
 		} else {
 			fmt.Print("     -> ")
 		}
@@ -237,14 +242,28 @@ func printHelp() {
 	fmt.Print(`MiniDB Help
 -----------
 SQL Commands:
-  CREATE TABLE name (col TYPE, ...)   Create a new table (types: INT, TEXT)
+  CREATE TABLE name (col TYPE, ...)   Create a new table (types: INT, TEXT, FLOAT, BOOL)
   INSERT INTO name VALUES (v1, v2)    Insert a row
   SELECT * FROM name [WHERE ...]      Query rows
   SELECT col1,col2 FROM name          Query with column selection
   UPDATE name SET col=val [WHERE ...] Update rows
   DELETE FROM name [WHERE ...]        Delete rows
 
+Transaction commands (ACID):
+  BEGIN [TRANSACTION]                 Start an explicit transaction
+  COMMIT [TRANSACTION]                Commit and persist the transaction
+  ROLLBACK [TRANSACTION]              Abort and undo all changes in the transaction
+
+  Tip: Without BEGIN, every statement auto-commits (default behaviour).
+  Prompt shows "minidb(txn)>" when inside an active transaction.
+
+JOIN queries:
+  SELECT * FROM t1 INNER JOIN t2 ON t1.col = t2.col
+  SELECT * FROM t1 LEFT JOIN t2 ON t1.col = t2.col
+
 WHERE operators: =  !=  <  >  <=  >=  AND  OR  NOT
+
+Data types: INT  TEXT  FLOAT  BOOL
 
 Meta-commands:
   \tables      List all tables
@@ -262,6 +281,12 @@ Examples:
   SELECT name FROM users WHERE id = 1;
   UPDATE users SET age = 31 WHERE id = 1;
   DELETE FROM users WHERE id = 2;
+
+  -- Transaction example:
+  BEGIN;
+  INSERT INTO users VALUES (3, 'Carol', 28);
+  UPDATE users SET age = 32 WHERE id = 1;
+  COMMIT;   -- or ROLLBACK to undo everything
 `)
 }
 
@@ -274,7 +299,10 @@ func looksIncomplete(sql string) bool {
 		strings.HasPrefix(upper, "INSERT") ||
 		strings.HasPrefix(upper, "UPDATE") ||
 		strings.HasPrefix(upper, "DELETE") ||
-		strings.HasPrefix(upper, "CREATE")
+		strings.HasPrefix(upper, "CREATE") ||
+		strings.HasPrefix(upper, "BEGIN") ||
+		strings.HasPrefix(upper, "COMMIT") ||
+		strings.HasPrefix(upper, "ROLLBACK")
 	return startsWithKeyword
 }
 
