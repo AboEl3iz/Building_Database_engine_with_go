@@ -190,6 +190,7 @@ func (w *WAL) Commit(txID TxID) error {
 }
 
 // Abort writes an ABORT record and rolls back the transaction's changes.
+// If tree is nil, only the ABORT record is written (caller is responsible for undo).
 func (w *WAL) Abort(txID TxID, tree *btree.BTree) error {
 	w.mu.Lock()
 
@@ -200,14 +201,18 @@ func (w *WAL) Abort(txID TxID, tree *btree.BTree) error {
 	}
 
 	_, err := w.appendRecord(rec)
+	delete(w.txnTable, txID)
 	w.mu.Unlock()
 
 	if err != nil {
 		return err
 	}
 
-	// Undo all changes made by this transaction
-	return w.undoTransaction(txID, tree)
+	// Only undo via WAL if the caller didn't handle undo themselves.
+	if tree != nil {
+		return w.undoTransaction(txID, tree)
+	}
+	return nil
 }
 
 // ---- Reading ----
