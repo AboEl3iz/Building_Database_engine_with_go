@@ -195,6 +195,26 @@ func (s *DeleteStmt) String() string {
 	return sql
 }
 
+// ---- Transaction control statements ----
+
+// BeginStmt represents: BEGIN [TRANSACTION]
+type BeginStmt struct{}
+
+func (s *BeginStmt) statementNode() {}
+func (s *BeginStmt) String() string    { return "BEGIN" }
+
+// CommitStmt represents: COMMIT [TRANSACTION]
+type CommitStmt struct{}
+
+func (s *CommitStmt) statementNode() {}
+func (s *CommitStmt) String() string    { return "COMMIT" }
+
+// RollbackStmt represents: ROLLBACK [TRANSACTION]
+type RollbackStmt struct{}
+
+func (s *RollbackStmt) statementNode() {}
+func (s *RollbackStmt) String() string    { return "ROLLBACK" }
+
 // ============================
 // Expression AST Nodes
 // ============================

@@ -97,10 +97,45 @@ func (p *Parser) parseStatement() (Statement, error) {
 		return p.parseDelete()
 	case TokenCREATE:
 		return p.parseCreate()
+	case TokenBEGIN:
+		return p.parseBegin()
+	case TokenCOMMIT:
+		return p.parseCommit()
+	case TokenROLLBACK:
+		return p.parseRollback()
 	default:
-		return nil, fmt.Errorf("parser: expected SELECT/INSERT/UPDATE/DELETE/CREATE, got %q at L%d:C%d",
+		return nil, fmt.Errorf("parser: expected SELECT/INSERT/UPDATE/DELETE/CREATE/BEGIN/COMMIT/ROLLBACK, got %q at L%d:C%d",
 			tok.Literal, tok.Line, tok.Col)
 	}
+}
+
+// ---- Transaction Control ----
+
+// parseBegin parses: BEGIN [TRANSACTION]
+func (p *Parser) parseBegin() (*BeginStmt, error) {
+	p.consume() // eat BEGIN
+	if p.peek().Type == TokenTRANSACTION {
+		p.consume() // eat optional TRANSACTION noise word
+	}
+	return &BeginStmt{}, nil
+}
+
+// parseCommit parses: COMMIT [TRANSACTION]
+func (p *Parser) parseCommit() (*CommitStmt, error) {
+	p.consume() // eat COMMIT
+	if p.peek().Type == TokenTRANSACTION {
+		p.consume() // eat optional TRANSACTION noise word
+	}
+	return &CommitStmt{}, nil
+}
+
+// parseRollback parses: ROLLBACK [TRANSACTION]
+func (p *Parser) parseRollback() (*RollbackStmt, error) {
+	p.consume() // eat ROLLBACK
+	if p.peek().Type == TokenTRANSACTION {
+		p.consume() // eat optional TRANSACTION noise word
+	}
+	return &RollbackStmt{}, nil
 }
 
 // ---- SELECT ----
