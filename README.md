@@ -9,6 +9,7 @@ A mini SQLite/Postgres-style database engine built from scratch in Go.
 | **Buffer Pool** | `internal/buffer/` | LRU in-memory page cache — avoids disk I/O on hot pages |
 | **B+ Tree** | `internal/btree/` | Core index structure — sorted key-value storage with range scans |
 | **WAL** | `internal/wal/` | Write-Ahead Log — crash recovery using ARIES (redo/undo) |
+| **Transaction Mgr** | `internal/txn/` | Session-level `BEGIN` / `COMMIT` / `ROLLBACK` with in-memory undo log |
 | **SQL Parser** | `internal/parser/` | Lexer + recursive descent parser → AST |
 | **Query Engine** | `internal/engine/` | Executes AST against storage, IndexScan / SeqScan / NestedLoopJoin |
 | **Catalog** | `internal/catalog/` | Table and column schema metadata (persisted as JSON) |
@@ -43,6 +44,36 @@ minidb> INSERT INTO products VALUES (2, 'candy', 0.50, FALSE);
 minidb> SELECT * FROM products WHERE price > 1.0;
 minidb> SELECT * FROM products WHERE active = TRUE;
 ```
+
+### Transactions (ACID)
+```sql
+-- Create a table for the demo
+minidb> CREATE TABLE accts (id INT, bal INT);
+minidb> INSERT INTO accts VALUES (1, 1000);
+minidb> INSERT INTO accts VALUES (2, 500);
+
+-- Successful multi-statement transaction
+minidb> BEGIN;
+transaction started
+minidb(txn)> INSERT INTO accts VALUES (3, 250);
+1 row inserted
+minidb(txn)> UPDATE accts SET bal = 900 WHERE id = 1;
+1 row(s) updated
+minidb(txn)> COMMIT;
+transaction committed
+minidb> SELECT * FROM accts;   -- 3 rows; id=1 has bal=900
+
+-- Transaction that is rolled back
+minidb> BEGIN;
+transaction started
+minidb(txn)> DELETE FROM accts WHERE id = 3;
+1 row(s) deleted
+minidb(txn)> ROLLBACK;
+transaction rolled back
+minidb> SELECT * FROM accts;   -- still 3 rows (DELETE was undone)
+```
+
+> **Note:** The prompt changes to `minidb(txn)>` while inside an active transaction. Without `BEGIN`, every statement auto-commits (backward-compatible).
 
 ### JOIN Queries
 ```sql
@@ -79,14 +110,21 @@ minidb> \quit
 # All tests
 go test ./tests/... -v
 
-# Specific feature tests
-go test ./tests/ -run TestFloat     # FLOAT type tests
-go test ./tests/ -run TestBool      # BOOL type tests
-go test ./tests/ -run TestJoin      # JOIN tests (general)
+# Transaction (ACID) tests
+go test ./tests/ -run TestTransaction -v   # all transaction tests
+go test ./tests/ -run TestParseBegin       # parser: BEGIN
+go test ./tests/ -run TestParseCommit      # parser: COMMIT
+go test ./tests/ -run TestParseRollback    # parser: ROLLBACK
+
+# JOIN tests
 go test ./tests/ -run TestEngineInnerJoin
 go test ./tests/ -run TestEngineLeftJoin
 go test ./tests/ -run TestParseInnerJoin
 go test ./tests/ -run TestParseLeftJoin
+
+# Type tests
+go test ./tests/ -run TestFloat
+go test ./tests/ -run TestBool
 
 # Legacy test suites
 go test ./tests/ -run TestBTree
@@ -108,11 +146,29 @@ go test ./tests/ -bench=. -benchmem
 3. Executor.executeInsert():
    a. Look up "users" schema in Catalog
    b. Validate column count
-   c. WAL.Begin() → get TxID
-   d. WAL.LogInsert() → write log record to .wal file (BEFORE modifying tree!)
-   e. BTree.Insert(pk=1, encodedRow) → find leaf, insert, split if needed
-   f. WAL.Commit() → flush commit record to .wal file
+   c. If TxManager.IsActive():
+      → WAL.LogInsert(activeTxID, ...)   ← shared TxID from BEGIN
+      → BTree.Insert(pk, encodedRow)
+      → TxManager.RecordInsert()         ← undo op saved for possible ROLLBACK
+   d. Else (auto-commit):
+      → WAL.Begin() → new TxID
+      → WAL.LogInsert() → BTree.Insert() → WAL.Commit()
 4. ResultSet("1 row inserted") → REPL prints it
+```
+
+### Data Flow: ROLLBACK
+
+```
+1. REPL reads "ROLLBACK"
+2. Parser.ParseSQL() → RollbackStmt AST
+3. Executor.executeRollback():
+   a. TxManager.Rollback()
+   b. Walk undo log in reverse (last-in, first-out):
+      - UndoInsert  → tree.Delete(key)
+      - UndoDelete  → tree.Insert(key, oldValue)
+      - UndoUpdate  → tree.Delete(key) + tree.Insert(key, oldValue)
+   c. WAL.Abort(txID, nil)  ← writes ABORT record; undo already done in memory
+4. ResultSet("transaction rolled back") → REPL prints it
 ```
 
 ### Data Flow: SELECT * FROM users WHERE age > 25
@@ -160,6 +216,11 @@ SELECT col1, col2 FROM name;
 UPDATE name SET col = val [WHERE expr];
 DELETE FROM name [WHERE expr];
 
+-- Transaction Control (ACID)
+BEGIN [TRANSACTION];     -- open an explicit transaction
+COMMIT [TRANSACTION];    -- persist all changes durably
+ROLLBACK [TRANSACTION];  -- undo all changes since BEGIN
+
 -- JOIN queries
 SELECT * FROM left_table INNER JOIN right_table ON left_table.col = right_table.col;
 SELECT * FROM left_table LEFT JOIN right_table ON left_table.col = right_table.col;
@@ -186,17 +247,50 @@ BOOL   -- boolean (literals: TRUE, FALSE)
 | Parser | Recursive descent | Simple, readable, easy to extend |
 | Row storage | In-memory cache + binary WAL encoding | Full type fidelity (INT/TEXT/FLOAT/BOOL) |
 | JOIN algorithm | Nested Loop Join | Simple O(n×m); sufficient for learning purposes |
+| Transaction isolation | Single-writer, no lock manager | No concurrent writers → reads always see committed state |
+| Undo log | In-memory per session | Fast ROLLBACK without WAL re-scan; lost on crash (WAL handles crash recovery) |
 
 ## Extending MiniDB
 
 - **Composite keys**: modify `btree.Key` to be a `[]byte` or struct
 - **Heap files**: store full variable-length rows in separate pages
 - **Hash/Merge Join**: replace Nested Loop Join for better performance on large tables
-- **Transactions**: add a lock manager for isolation (currently no locking)
+- **Lock manager**: add row-level or table-level locks for true multi-writer isolation
+- **Savepoints**: `SAVEPOINT name` / `ROLLBACK TO name` using a stack of undo-log checkpoints
 - **Index on non-PK**: build a secondary B+ tree per indexed column
 - **DECIMAL type**: extend `DataType` with fixed-precision arithmetic
 
 ## Changelog
+
+### v3.0 — ACID Transactions (2026-03-22)
+
+#### ACID Properties
+| Property | Implementation |
+|---|---|
+| **Atomicity** | `ROLLBACK` reverses all ops in the session undo log (last-in, first-out) |
+| **Consistency** | Schema / type checks enforced by executor before every mutation |
+| **Isolation** | Single-writer engine — no concurrent writers; reads see only committed data |
+| **Durability** | `COMMIT` calls `WAL.Commit()` → `file.Sync()` — changes survive crash |
+
+#### New SQL Commands
+- **`BEGIN [TRANSACTION]`** — opens an explicit transaction; prompt changes to `minidb(txn)>`
+- **`COMMIT [TRANSACTION]`** — writes WAL COMMIT record + `fsync`, finalises transaction
+- **`ROLLBACK [TRANSACTION]`** — applies undo log in reverse, writes WAL ABORT record
+- Auto-commit preserved — every DML without `BEGIN` still auto-begins and auto-commits
+
+#### Files Changed
+| File | Change |
+|---|---|
+| `internal/txn/manager.go` | **[NEW]** `TxManager`: `Begin()`, `Commit()`, `Rollback()`, undo log, `RecordInsert/Update/Delete()` |
+| `internal/parser/lexer.go` | 4 new tokens: `BEGIN`, `COMMIT`, `ROLLBACK`, `TRANSACTION` |
+| `internal/parser/ast.go` | 3 new AST nodes: `BeginStmt`, `CommitStmt`, `RollbackStmt` |
+| `internal/parser/parser.go` | `parseBegin`, `parseCommit`, `parseRollback`; dispatch in `parseStatement` |
+| `internal/engine/executor.go` | `txm *TxManager` field; `executeBegin/Commit/Rollback`; dual auto-commit/explicit mode in INSERT/UPDATE/DELETE |
+| `internal/wal/wal.go` | `Abort()` accepts `nil` tree (caller-managed undo); cleans `txnTable` on abort |
+| `cmd/minidb/main.go` | Transaction-aware prompt `minidb(txn)>`; BEGIN/COMMIT/ROLLBACK in help + `looksIncomplete` |
+| `tests/transaction_test.go` | **[NEW]** 12 tests: begin/commit, rollback insert/update/delete, multi-op, auto-commit, error cases, parser tests |
+
+---
 
 ### v2.0 — JOIN + FLOAT/BOOL Types (2026-03-19)
 
