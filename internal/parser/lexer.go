@@ -72,6 +72,12 @@ const (
 	TokenROLLBACK    // ROLLBACK
 	TokenTRANSACTION // TRANSACTION (optional noise word)
 
+	// ---- Index keywords ----
+	TokenINDEX   // INDEX
+	TokenUNIQUE  // UNIQUE
+	TokenSHOW    // SHOW
+	TokenINDEXES // INDEXES
+
 	// ---- Literals ----
 	TokenIDENT    // identifier: table name, column name, etc. (e.g., "users", "age")
 	TokenINTLIT   // integer literal: 42, -7, 0
@@ -109,6 +115,7 @@ var tokenTypeNames = map[TokenType]string{
 	TokenTRUE: "TRUE", TokenFALSE: "FALSE",
 	TokenJOIN: "JOIN", TokenON: "ON", TokenINNER: "INNER", TokenLEFT: "LEFT",
 	TokenBEGIN: "BEGIN", TokenCOMMIT: "COMMIT", TokenROLLBACK: "ROLLBACK", TokenTRANSACTION: "TRANSACTION",
+	TokenINDEX: "INDEX", TokenUNIQUE: "UNIQUE", TokenSHOW: "SHOW", TokenINDEXES: "INDEXES",
 	TokenIDENT: "IDENT", TokenINTLIT: "INT_LIT", TokenFLOATLIT: "FLOAT_LIT", TokenSTRLIT: "STR_LIT",
 	TokenSTAR: "*", TokenEQ: "=", TokenNEQ: "!=", TokenLT: "<", TokenGT: ">",
 	TokenLTE: "<=", TokenGTE: ">=",
@@ -136,6 +143,7 @@ var keywords = map[string]TokenType{
 	"TRUE": TokenTRUE, "FALSE": TokenFALSE,
 	"JOIN": TokenJOIN, "ON": TokenON, "INNER": TokenINNER, "LEFT": TokenLEFT,
 	"BEGIN": TokenBEGIN, "COMMIT": TokenCOMMIT, "ROLLBACK": TokenROLLBACK, "TRANSACTION": TokenTRANSACTION,
+	"INDEX": TokenINDEX, "UNIQUE": TokenUNIQUE, "SHOW": TokenSHOW, "INDEXES": TokenINDEXES,
 }
 
 // Token is one atomic unit of the SQL input.
