@@ -31,6 +31,7 @@ type TableSchema struct {
 	Columns    []ColumnSchema      // ordered list of columns
 	RootPageID disk.PageID         // PageID of the B+ tree root for this table
 	ColIndex   map[string]int      // column name → index (for fast lookup)
+	Indexes    []IndexSchema       // secondary indexes on this table
 }
 
 // ColumnSchema describes one column.
@@ -38,6 +39,15 @@ type ColumnSchema struct {
 	Name     string          // column name (e.g., "age")
 	Type     parser.DataType // INT or TEXT
 	Offset   int             // column's position (0-based) in a row's value array
+}
+
+// IndexSchema describes one secondary index.
+type IndexSchema struct {
+	Name       string      // index name (e.g., "idx_age")
+	TableName  string      // owning table
+	Column     string      // indexed column name
+	RootPageID disk.PageID // PageID of the secondary B+ tree root
+	Unique     bool        // whether the index enforces uniqueness
 }
 
 // Catalog manages all table schemas.
@@ -145,6 +155,85 @@ func (c *Catalog) DropTable(name string) error {
 	return c.persist()
 }
 
+// ---- Index Methods ----
+
+// CreateIndex registers a secondary index in the catalog for the given table.
+func (c *Catalog) CreateIndex(tableName, indexName, column string, rootPageID disk.PageID, unique bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	schema, ok := c.tables[tableName]
+	if !ok {
+		return fmt.Errorf("catalog: table %q does not exist", tableName)
+	}
+	for _, idx := range schema.Indexes {
+		if idx.Name == indexName {
+			return fmt.Errorf("catalog: index %q already exists", indexName)
+		}
+	}
+	schema.Indexes = append(schema.Indexes, IndexSchema{
+		Name:       indexName,
+		TableName:  tableName,
+		Column:     column,
+		RootPageID: rootPageID,
+		Unique:     unique,
+	})
+	return c.persist()
+}
+
+// DropIndex removes a secondary index from the catalog.
+func (c *Catalog) DropIndex(tableName, indexName string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	schema, ok := c.tables[tableName]
+	if !ok {
+		return fmt.Errorf("catalog: table %q does not exist", tableName)
+	}
+	for i, idx := range schema.Indexes {
+		if idx.Name == indexName {
+			schema.Indexes = append(schema.Indexes[:i], schema.Indexes[i+1:]...)
+			return c.persist()
+		}
+	}
+	return fmt.Errorf("catalog: index %q does not exist on table %q", indexName, tableName)
+}
+
+// GetIndex returns the IndexSchema for a named index on a table.
+func (c *Catalog) GetIndex(tableName, indexName string) (*IndexSchema, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	schema, ok := c.tables[tableName]
+	if !ok {
+		return nil, fmt.Errorf("catalog: table %q does not exist", tableName)
+	}
+	for i := range schema.Indexes {
+		if schema.Indexes[i].Name == indexName {
+			return &schema.Indexes[i], nil
+		}
+	}
+	return nil, fmt.Errorf("catalog: index %q does not exist on table %q", indexName, tableName)
+}
+
+// UpdateIndexRootPageID updates the root page for a secondary index.
+func (c *Catalog) UpdateIndexRootPageID(tableName, indexName string, newRootID disk.PageID) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	schema, ok := c.tables[tableName]
+	if !ok {
+		return fmt.Errorf("catalog: table %q not found", tableName)
+	}
+	for i := range schema.Indexes {
+		if schema.Indexes[i].Name == indexName {
+			schema.Indexes[i].RootPageID = newRootID
+			return c.persist()
+		}
+	}
+	return fmt.Errorf("catalog: index %q not found on table %q", indexName, tableName)
+}
+
 // UpdateRootPageID updates the root page for a table.
 // Called when a B+ tree's root changes (e.g., after root split).
 func (c *Catalog) UpdateRootPageID(tableName string, newRootID disk.PageID) error {
@@ -172,6 +261,7 @@ type tableJSON struct {
 	Name       string       `json:"name"`
 	Columns    []columnJSON `json:"columns"`
 	RootPageID uint32       `json:"root_page_id"`
+	Indexes    []indexJSON  `json:"indexes,omitempty"`
 }
 
 type columnJSON struct {
@@ -180,8 +270,15 @@ type columnJSON struct {
 	Offset int    `json:"offset"`
 }
 
+type indexJSON struct {
+	Name       string `json:"name"`
+	Column     string `json:"column"`
+	RootPageID uint32 `json:"root_page_id"`
+	Unique     bool   `json:"unique"`
+}
+
 // persist writes the catalog to disk as JSON.
-// Called after every write (CreateTable, DropTable).
+// Called after every write (CreateTable, DropTable, CreateIndex, DropIndex).
 func (c *Catalog) persist() error {
 	var cj catalogJSON
 	for _, schema := range c.tables {
@@ -194,6 +291,14 @@ func (c *Catalog) persist() error {
 				Name:   col.Name,
 				Type:   int(col.Type),
 				Offset: col.Offset,
+			})
+		}
+		for _, idx := range schema.Indexes {
+			tj.Indexes = append(tj.Indexes, indexJSON{
+				Name:       idx.Name,
+				Column:     idx.Column,
+				RootPageID: uint32(idx.RootPageID),
+				Unique:     idx.Unique,
 			})
 		}
 		cj.Tables = append(cj.Tables, tj)
@@ -228,11 +333,22 @@ func (c *Catalog) loadFromJSON(data []byte) error {
 			}
 			colIndex[col.Name] = i
 		}
+		idxSchemas := make([]IndexSchema, len(tj.Indexes))
+		for i, idx := range tj.Indexes {
+			idxSchemas[i] = IndexSchema{
+				Name:       idx.Name,
+				TableName:  tj.Name,
+				Column:     idx.Column,
+				RootPageID: disk.PageID(idx.RootPageID),
+				Unique:     idx.Unique,
+			}
+		}
 		c.tables[tj.Name] = &TableSchema{
 			Name:       tj.Name,
 			Columns:    colSchemas,
 			RootPageID: disk.PageID(tj.RootPageID),
 			ColIndex:   colIndex,
+			Indexes:    idxSchemas,
 		}
 	}
 	return nil
