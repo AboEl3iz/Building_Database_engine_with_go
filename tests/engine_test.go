@@ -553,3 +553,151 @@ func TestEngineInnerJoinNoMatches(t *testing.T) {
 	}
 }
 
+// ==== Secondary Index Tests ====
+
+func TestCreateIndex(t *testing.T) {
+	exec, cleanup := newTestEngine(t)
+	defer cleanup()
+
+	_ = execSQL(t, exec, "CREATE TABLE users (id INT, name TEXT, age INT)")
+	_ = execSQL(t, exec, "INSERT INTO users VALUES (1, 'Alice', 30)")
+	_ = execSQL(t, exec, "INSERT INTO users VALUES (2, 'Bob', 25)")
+
+	rs := execSQL(t, exec, "CREATE INDEX idx_age ON users (age)")
+	if rs.Rows[0]["result"] != "Index \"idx_age\" created on users(age)" {
+		t.Errorf("Unexpected result: %v", rs.Rows[0]["result"])
+	}
+
+	// Verify catalog metadata
+	rs2 := execSQL(t, exec, "SHOW INDEXES FROM users")
+	if len(rs2.Rows) != 1 {
+		t.Fatalf("Expected 1 index, got %d", len(rs2.Rows))
+	}
+	if rs2.Rows[0]["index_name"] != "idx_age" || rs2.Rows[0]["column"] != "age" {
+		t.Errorf("Unexpected index metadata: %v", rs2.Rows[0])
+	}
+}
+
+func TestSecondaryIndexScan(t *testing.T) {
+	exec, cleanup := newTestEngine(t)
+	defer cleanup()
+
+	_ = execSQL(t, exec, "CREATE TABLE users (id INT, name TEXT, age INT)")
+	_ = execSQL(t, exec, "INSERT INTO users VALUES (1, 'Alice', 30)")
+	_ = execSQL(t, exec, "INSERT INTO users VALUES (2, 'Bob', 25)")
+	_ = execSQL(t, exec, "INSERT INTO users VALUES (3, 'Carol', 30)")
+
+	_ = execSQL(t, exec, "CREATE INDEX idx_age ON users (age)")
+
+	// This should trigger a secondary index scan.
+	// Since 2 rows correspond to age=30, we should get both back.
+	rs := execSQL(t, exec, "SELECT name FROM users WHERE age = 30 ORDER BY name ASC")
+	if len(rs.Rows) != 2 {
+		t.Fatalf("Expected 2 rows, got %d", len(rs.Rows))
+	}
+	if rs.Rows[0]["name"] != "Alice" || rs.Rows[1]["name"] != "Carol" {
+		t.Errorf("Unexpected result rows: %v", rs.Rows)
+	}
+}
+
+func TestIndexMaintainedOnInsert(t *testing.T) {
+	exec, cleanup := newTestEngine(t)
+	defer cleanup()
+
+	_ = execSQL(t, exec, "CREATE TABLE users (id INT, name TEXT, age INT)")
+	_ = execSQL(t, exec, "CREATE INDEX idx_age ON users (age)")
+	_ = execSQL(t, exec, "INSERT INTO users VALUES (1, 'Alice', 30)") // Insert AFTER index creation
+	
+	rs := execSQL(t, exec, "SELECT name FROM users WHERE age = 30")
+	if len(rs.Rows) != 1 || rs.Rows[0]["name"] != "Alice" {
+		t.Errorf("Index scan didn't find newly inserted row. Rows: %v", rs.Rows)
+	}
+}
+
+func TestIndexMaintainedOnUpdate(t *testing.T) {
+	exec, cleanup := newTestEngine(t)
+	defer cleanup()
+
+	_ = execSQL(t, exec, "CREATE TABLE users (id INT, name TEXT, age INT)")
+	_ = execSQL(t, exec, "INSERT INTO users VALUES (1, 'Alice', 30)")
+	_ = execSQL(t, exec, "CREATE INDEX idx_age ON users (age)")
+	_ = execSQL(t, exec, "UPDATE users SET age = 31 WHERE id = 1") // Update indexed value
+
+	// Old value should not match
+	rsOld := execSQL(t, exec, "SELECT name FROM users WHERE age = 30")
+	if len(rsOld.Rows) != 0 {
+		t.Errorf("Old value still returned results: %v", rsOld.Rows)
+	}
+
+	// New value should match
+	rsNew := execSQL(t, exec, "SELECT name FROM users WHERE age = 31")
+	if len(rsNew.Rows) != 1 || rsNew.Rows[0]["name"] != "Alice" {
+		t.Errorf("New value not found in index. Rows: %v", rsNew.Rows)
+	}
+}
+
+func TestIndexMaintainedOnDelete(t *testing.T) {
+	exec, cleanup := newTestEngine(t)
+	defer cleanup()
+
+	_ = execSQL(t, exec, "CREATE TABLE users (id INT, name TEXT, age INT)")
+	_ = execSQL(t, exec, "INSERT INTO users VALUES (1, 'Alice', 30)")
+	_ = execSQL(t, exec, "CREATE INDEX idx_age ON users (age)")
+	_ = execSQL(t, exec, "DELETE FROM users WHERE id = 1")
+
+	// Look up by indexed value should return empty
+	rs := execSQL(t, exec, "SELECT name FROM users WHERE age = 30")
+	if len(rs.Rows) != 0 {
+		t.Errorf("Deleted row still returned results: %v", rs.Rows)
+	}
+}
+
+func TestDropIndex(t *testing.T) {
+	exec, cleanup := newTestEngine(t)
+	defer cleanup()
+
+	_ = execSQL(t, exec, "CREATE TABLE users (id INT, name TEXT, age INT)")
+	_ = execSQL(t, exec, "INSERT INTO users VALUES (1, 'Alice', 30)")
+	_ = execSQL(t, exec, "CREATE INDEX idx_age ON users (age)")
+
+	rsDrop := execSQL(t, exec, "DROP INDEX idx_age ON users")
+	if rsDrop.Rows[0]["result"] != "Index \"idx_age\" dropped" {
+		t.Errorf("Unexpected drop result: %v", rsDrop.Rows[0])
+	}
+
+	// Verify catalog metadata
+	rsShow := execSQL(t, exec, "SHOW INDEXES FROM users")
+	if len(rsShow.Rows) != 0 {
+		t.Errorf("Expected 0 indexes, got %d", len(rsShow.Rows))
+	}
+
+	// Querying on the field should fall back to sequential scan and still work
+	rsSelect := execSQL(t, exec, "SELECT name FROM users WHERE age = 30")
+	if len(rsSelect.Rows) != 1 || rsSelect.Rows[0]["name"] != "Alice" {
+		t.Errorf("Secondary query failed after DROP INDEX. Rows: %v", rsSelect.Rows)
+	}
+}
+
+func TestUniqueIndexConstraint(t *testing.T) {
+	exec, cleanup := newTestEngine(t)
+	defer cleanup()
+
+	_ = execSQL(t, exec, "CREATE TABLE users (id INT, email TEXT)")
+	_ = execSQL(t, exec, "CREATE UNIQUE INDEX idx_email ON users (email)")
+	_ = execSQL(t, exec, "INSERT INTO users VALUES (1, 'alice@example.com')")
+
+	// Attempting to insert duplicate should fail
+	stmt, _ := parser.ParseSQL("INSERT INTO users VALUES (2, 'alice@example.com')")
+	_, err := exec.Execute(stmt)
+	if err == nil {
+		t.Error("Expected UNIQUE constraint violation error, got nil")
+	} else if err.Error() != "executor: UNIQUE constraint violation on index \"idx_email\": duplicate value alice@example.com for column \"email\"" {
+		t.Errorf("Unexpected error message: %v", err)
+	}
+
+	// Verify the duplicate row was rejected
+	rs := execSQL(t, exec, "SELECT id FROM users WHERE email = 'alice@example.com'")
+	if len(rs.Rows) != 1 || rs.Rows[0]["id"] != int64(1) {
+		t.Errorf("Expected ONLY original row to be present, got rows: %v", rs.Rows)
+	}
+}

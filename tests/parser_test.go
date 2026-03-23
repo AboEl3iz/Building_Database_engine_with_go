@@ -531,3 +531,77 @@ func TestParseBareJoin(t *testing.T) {
 	}
 }
 
+// ---- Index statements parsing tests ----
+
+func TestParseCreateIndex(t *testing.T) {
+	stmt, err := parser.ParseSQL("CREATE INDEX idx_age ON users (age)")
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	create, ok := stmt.(*parser.CreateIndexStmt)
+	if !ok {
+		t.Fatalf("Expected *CreateIndexStmt, got %T", stmt)
+	}
+	if create.IndexName != "idx_age" || create.TableName != "users" || create.Column != "age" || create.Unique {
+		t.Errorf("Unexpected values in CreateIndexStmt: %+v", create)
+	}
+}
+
+func TestParseCreateUniqueIndex(t *testing.T) {
+	stmt, err := parser.ParseSQL("CREATE UNIQUE INDEX idx_id ON users (id)")
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	create, ok := stmt.(*parser.CreateIndexStmt)
+	if !ok {
+		t.Fatalf("Expected *CreateIndexStmt, got %T", stmt)
+	}
+	if !create.Unique {
+		t.Error("Expected index to be unique")
+	}
+}
+
+func TestParseDropIndex(t *testing.T) {
+	stmt, err := parser.ParseSQL("DROP INDEX idx_age ON users")
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	drop, ok := stmt.(*parser.DropIndexStmt)
+	if !ok {
+		t.Fatalf("Expected *DropIndexStmt, got %T", stmt)
+	}
+	if drop.IndexName != "idx_age" || drop.TableName != "users" {
+		t.Errorf("Unexpected values in DropIndexStmt: %+v", drop)
+	}
+}
+
+func TestParseShowIndexes(t *testing.T) {
+	stmt, err := parser.ParseSQL("SHOW INDEXES")
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+	show, ok := stmt.(*parser.ShowIndexesStmt)
+	if !ok {
+		t.Fatalf("Expected *ShowIndexesStmt, got %T", stmt)
+	}
+	if show.TableName != "" {
+		t.Errorf("Expected empty TableName, got %q", show.TableName)
+	}
+
+	stmt2, err := parser.ParseSQL("SHOW INDEXES FROM users")
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+	show2, ok := stmt2.(*parser.ShowIndexesStmt)
+	if !ok {
+		t.Fatalf("Expected *ShowIndexesStmt, got %T", stmt2)
+	}
+	if show2.TableName != "users" {
+		t.Errorf("Expected TableName='users', got %q", show2.TableName)
+	}
+}
+
+
