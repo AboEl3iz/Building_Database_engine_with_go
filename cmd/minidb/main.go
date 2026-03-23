@@ -243,6 +243,9 @@ func printHelp() {
 -----------
 SQL Commands:
   CREATE TABLE name (col TYPE, ...)   Create a new table (types: INT, TEXT, FLOAT, BOOL)
+  CREATE [UNIQUE] INDEX name ON table (col) Create a secondary index
+  DROP INDEX name ON table            Drop a secondary index
+  SHOW INDEXES [FROM table]           List secondary indexes
   INSERT INTO name VALUES (v1, v2)    Insert a row
   SELECT * FROM name [WHERE ...]      Query rows
   SELECT col1,col2 FROM name          Query with column selection
@@ -300,6 +303,8 @@ func looksIncomplete(sql string) bool {
 		strings.HasPrefix(upper, "UPDATE") ||
 		strings.HasPrefix(upper, "DELETE") ||
 		strings.HasPrefix(upper, "CREATE") ||
+		strings.HasPrefix(upper, "DROP") ||
+		strings.HasPrefix(upper, "SHOW") ||
 		strings.HasPrefix(upper, "BEGIN") ||
 		strings.HasPrefix(upper, "COMMIT") ||
 		strings.HasPrefix(upper, "ROLLBACK")
