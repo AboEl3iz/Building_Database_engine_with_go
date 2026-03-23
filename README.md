@@ -3,17 +3,17 @@
 A mini SQLite/Postgres-style database engine built from scratch in Go.
 
 ## Components
-| Component | File(s) | What it does |
-|---|---|---|
-| **Disk Manager** | `internal/disk/` | Raw page I/O — reads/writes 4KB blocks to a `.db` file |
-| **Buffer Pool** | `internal/buffer/` | LRU in-memory page cache — avoids disk I/O on hot pages |
-| **B+ Tree** | `internal/btree/` | Core index structure — sorted key-value storage with range scans |
-| **WAL** | `internal/wal/` | Write-Ahead Log — crash recovery using ARIES (redo/undo) |
-| **Transaction Mgr** | `internal/txn/` | Session-level `BEGIN` / `COMMIT` / `ROLLBACK` with in-memory undo log |
-| **SQL Parser** | `internal/parser/` | Lexer + recursive descent parser → AST |
-| **Query Engine** | `internal/engine/` | Executes AST against storage, IndexScan / SeqScan / NestedLoopJoin |
-| **Catalog** | `internal/catalog/` | Table and column schema metadata (persisted as JSON) |
-| **REPL** | `cmd/minidb/` | Interactive SQL shell |
+| Component | Package | Description |
+|-----------|---------|-------------|
+| **REPL** | `cmd/minidb` | Interactive command-line interface. |
+| **Parser** | `internal/parser` | Lexer & recursive descent parser that builds an Abstract Syntax Tree (AST). |
+| **Executor** | `internal/engine` | Query planner/evaluator. Coordinates B+ tree searches, joins, inserting, and secondary index maintenance. |
+| **Catalog** | `internal/catalog` | Manages schemas, tables, and secondary indexes. Persisted as JSON. |
+| **B+ Tree** | `internal/btree` | O(log n) ordered key-value storage. Used for primary tables and secondary indexes. |
+| **Buffer Pool** | `internal/buffer` | In-memory page cache with LRU eviction policy. |
+| **Disk Manager** | `internal/disk` | Handles raw file I/O for 4KB pages. |
+| **WAL** | `internal/wal` | Write-Ahead Log for durability and transaction rollback. |
+| **Transaction Mgr** | `internal/txn` | Session-level `BEGIN` / `COMMIT` / `ROLLBACK` with in-memory undo log |
 
 ## Quick Start
 
@@ -209,22 +209,27 @@ If the process crashes mid-transaction:
 -- Data Definition
 CREATE TABLE name (col1 INT, col2 TEXT, col3 FLOAT, col4 BOOL);
 
--- Data Manipulation
-INSERT INTO name VALUES (1, 'text', 3.14, TRUE);
-SELECT * FROM name [WHERE expr] [ORDER BY col [ASC|DESC]] [LIMIT n];
-SELECT col1, col2 FROM name;
-UPDATE name SET col = val [WHERE expr];
-DELETE FROM name [WHERE expr];
+-- Data Manipulation (DML)
+INSERT INTO table_name VALUES (v1, v2, ...);
+SELECT * FROM table_name [WHERE expr] [ORDER BY col [ASC|DESC]] [LIMIT n];
+SELECT col1, col2 FROM table_name [WHERE expr];
+UPDATE table_name SET col=val [WHERE expr];
+DELETE FROM table_name [WHERE expr];
 
--- Transaction Control (ACID)
-BEGIN [TRANSACTION];     -- open an explicit transaction
-COMMIT [TRANSACTION];    -- persist all changes durably
-ROLLBACK [TRANSACTION];  -- undo all changes since BEGIN
+-- Joins
+SELECT * FROM t1 INNER JOIN t2 ON t1.col = t2.col;
+SELECT * FROM t1 LEFT JOIN t2 ON t1.col = t2.col;
+SELECT * FROM t1 JOIN t2 ... -- defaults to INNER JOIN
 
--- JOIN queries
-SELECT * FROM left_table INNER JOIN right_table ON left_table.col = right_table.col;
-SELECT * FROM left_table LEFT JOIN right_table ON left_table.col = right_table.col;
-SELECT * FROM left_table JOIN right_table ON left_table.col = right_table.col;  -- defaults to INNER
+-- Indexes
+CREATE [UNIQUE] INDEX index_name ON table_name (column_name);
+DROP INDEX index_name ON table_name;
+SHOW INDEXES [FROM table_name];
+
+-- Transactions (ACID)
+BEGIN [TRANSACTION];
+COMMIT [TRANSACTION];
+ROLLBACK [TRANSACTION];
 
 -- WHERE operators
 =  !=  <  >  <=  >=  AND  OR  NOT
@@ -238,42 +243,23 @@ BOOL   -- boolean (literals: TRUE, FALSE)
 
 ## Key Design Decisions
 
-| Decision | Choice | Why |
-|---|---|---|
-| Page size | 4096 bytes | Matches OS virtual memory page = efficient I/O |
-| Index structure | B+ Tree | O(log n) point lookup + O(log n + k) range scan |
-| Cache policy | LRU | Simple, effective for most workloads |
-| Recovery | ARIES (simplified) | Industry standard for WAL-based recovery |
-| Parser | Recursive descent | Simple, readable, easy to extend |
-| Row storage | In-memory cache + binary WAL encoding | Full type fidelity (INT/TEXT/FLOAT/BOOL) |
-| JOIN algorithm | Nested Loop Join | Simple O(n×m); sufficient for learning purposes |
-| Transaction isolation | Single-writer, no lock manager | No concurrent writers → reads always see committed state |
-| Undo log | In-memory per session | Fast ROLLBACK without WAL re-scan; lost on crash (WAL handles crash recovery) |
+1.  **Page size:** 4096 bytes (matches OS virtual memory page = efficient I/O).
+2.  **Index structure:** B+ Tree (O(log n) point lookup + O(log n + k) range scan).
+3.  **Cache policy:** LRU (simple, effective for most workloads).
+4.  **Write-Ahead Log (WAL):** Ensures durability (so crash recovery is possible) and allows transactions to be rolled back.
+5.  **No query optimizer (yet):** Queries are executed using simple heuristics (e.g. use an index if `WHERE primary_key = lit` or `WHERE indexed_col = lit`, otherwise sequential scan).
+6.  **Secondary Indexes:** Stored as separate B+ trees where the key is the indexed column value and the value is the primary key. Planners transparently use them for O(log n) equality lookups.
 
 ## Extending MiniDB
 
-- **Composite keys**: modify `btree.Key` to be a `[]byte` or struct
-- **Heap files**: store full variable-length rows in separate pages
-- **Hash/Merge Join**: replace Nested Loop Join for better performance on large tables
-- **Lock manager**: add row-level or table-level locks for true multi-writer isolation
-- **Savepoints**: `SAVEPOINT name` / `ROLLBACK TO name` using a stack of undo-log checkpoints
-- **Index on non-PK**: build a secondary B+ tree per indexed column
-- **DECIMAL type**: extend `DataType` with fixed-precision arithmetic
+### 1. Extensibility
+Because it's written from scratch and highly modular, you can easily add:
+- **String indexing** (B-tree needs a string comparator).
+- **Secondary Indexes** (add a catalog entry mapping `colName -> BTreeRoot`, intercept `executeSelect` to use it).
+- **Advanced joins** (Hash Join or Sort-Merge Join).
 
 ## Changelog
 
-### v3.0 — ACID Transactions (2026-03-22)
-
-#### ACID Properties
-| Property | Implementation |
-|---|---|
-| **Atomicity** | `ROLLBACK` reverses all ops in the session undo log (last-in, first-out) |
-| **Consistency** | Schema / type checks enforced by executor before every mutation |
-| **Isolation** | Single-writer engine — no concurrent writers; reads see only committed data |
-| **Durability** | `COMMIT` calls `WAL.Commit()` → `file.Sync()` — changes survive crash |
-
-#### New SQL Commands
-- **`BEGIN [TRANSACTION]`** — opens an explicit transaction; prompt changes to `minidb(txn)>`
 - **`COMMIT [TRANSACTION]`** — writes WAL COMMIT record + `fsync`, finalises transaction
 - **`ROLLBACK [TRANSACTION]`** — applies undo log in reverse, writes WAL ABORT record
 - Auto-commit preserved — every DML without `BEGIN` still auto-begins and auto-commits
