@@ -215,6 +215,49 @@ type RollbackStmt struct{}
 func (s *RollbackStmt) statementNode() {}
 func (s *RollbackStmt) String() string    { return "ROLLBACK" }
 
+// ---- Index control statements ----
+
+// CreateIndexStmt represents: CREATE [UNIQUE] INDEX name ON table (col)
+type CreateIndexStmt struct {
+	IndexName string
+	TableName string
+	Column    string
+	Unique    bool
+}
+
+func (s *CreateIndexStmt) statementNode() {}
+func (s *CreateIndexStmt) String() string {
+	unique := ""
+	if s.Unique {
+		unique = "UNIQUE "
+	}
+	return fmt.Sprintf("CREATE %sINDEX %s ON %s (%s)", unique, s.IndexName, s.TableName, s.Column)
+}
+
+// DropIndexStmt represents: DROP INDEX name
+type DropIndexStmt struct {
+	IndexName string
+	TableName string // required to look up the table in catalog
+}
+
+func (s *DropIndexStmt) statementNode() {}
+func (s *DropIndexStmt) String() string {
+	return fmt.Sprintf("DROP INDEX %s ON %s", s.IndexName, s.TableName)
+}
+
+// ShowIndexesStmt represents: SHOW INDEXES [FROM table]
+type ShowIndexesStmt struct {
+	TableName string // empty = show all indexes across all tables
+}
+
+func (s *ShowIndexesStmt) statementNode() {}
+func (s *ShowIndexesStmt) String() string {
+	if s.TableName != "" {
+		return "SHOW INDEXES FROM " + s.TableName
+	}
+	return "SHOW INDEXES"
+}
+
 // ============================
 // Expression AST Nodes
 // ============================
