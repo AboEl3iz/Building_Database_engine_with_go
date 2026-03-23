@@ -21,17 +21,18 @@ import (
 //
 // Execution pipeline for a SELECT:
 //  1. Look up table schema in catalog
-//  2. Decide: use IndexScan (WHERE pk = ?) or SeqScan (everything else)
+//  2. Decide: use IndexScan (WHERE pk = ?) or SecondaryIndexScan or SeqScan
 //  3. For each matching row: apply WHERE filter
 //  4. Apply projection (pick only requested columns)
 //  5. Apply ORDER BY + LIMIT
 //  6. Return ResultSet
 type Executor struct {
-	bp    *buffer.BufferPool
-	cat   *catalog.Catalog
-	wal   *wal.WAL
-	txm   *txn.TxManager      // session-level transaction manager
-	trees map[string]*btree.BTree // table name → B+ tree
+	bp      *buffer.BufferPool
+	cat     *catalog.Catalog
+	wal     *wal.WAL
+	txm     *txn.TxManager       // session-level transaction manager
+	trees   map[string]*btree.BTree // table name → B+ tree
+	indexes map[string]*btree.BTree // index name → secondary B+ tree
 }
 
 // NewExecutor creates an Executor with the given dependencies.
@@ -43,11 +44,12 @@ func NewExecutor(bp *buffer.BufferPool, cat *catalog.Catalog, w *wal.WAL, txm ..
 		tm = txn.NewTxManager(w) // default: create one automatically
 	}
 	return &Executor{
-		bp:    bp,
-		cat:   cat,
-		wal:   w,
-		txm:   tm,
-		trees: make(map[string]*btree.BTree),
+		bp:      bp,
+		cat:     cat,
+		wal:     w,
+		txm:     tm,
+		trees:   make(map[string]*btree.BTree),
+		indexes: make(map[string]*btree.BTree),
 	}
 }
 
@@ -76,6 +78,14 @@ func (e *Executor) Execute(stmt parser.Statement) (*ResultSet, error) {
 		return e.executeCommit()
 	case *parser.RollbackStmt:
 		return e.executeRollback()
+
+	// ---- Index control ----
+	case *parser.CreateIndexStmt:
+		return e.executeCreateIndex(s)
+	case *parser.DropIndexStmt:
+		return e.executeDropIndex(s)
+	case *parser.ShowIndexesStmt:
+		return e.executeShowIndexes(s)
 
 	default:
 		return nil, fmt.Errorf("executor: unsupported statement type %T", stmt)
@@ -142,6 +152,188 @@ func (e *Executor) executeCreate(stmt *parser.CreateTableStmt) (*ResultSet, erro
 	rs.AddRow(Row{"result": fmt.Sprintf("Table %q created", stmt.TableName)})
 	return rs, nil
 }
+
+// ---- CREATE INDEX ----
+//
+// A secondary index is a separate B+ tree where:
+//   key   = indexed column value (encoded as int64)
+//   value = primary key of the matching row
+//
+// On SELECT WHERE indexed_col = value:
+//   1. Look up key in secondary index tree → get pk
+//   2. Search primary tree with pk → get full row
+//
+// This gives O(log n) lookup vs O(n) sequential scan.
+
+func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*ResultSet, error) {
+	schema, err := e.cat.GetTable(stmt.TableName)
+	if err != nil {
+		return nil, err
+	}
+
+	// Verify column exists
+	colIdx, ok := schema.ColIndex[stmt.Column]
+	if !ok {
+		return nil, fmt.Errorf("executor: column %q does not exist in table %q", stmt.Column, stmt.TableName)
+	}
+
+	// Allocate a new B+ tree for this secondary index
+	idxTree, err := btree.NewBTree(e.bp)
+	if err != nil {
+		return nil, fmt.Errorf("executor: cannot create B+ tree for index %q: %w", stmt.IndexName, err)
+	}
+
+	// Register in catalog
+	if err := e.cat.CreateIndex(stmt.TableName, stmt.IndexName, stmt.Column, idxTree.RootPageID(), stmt.Unique); err != nil {
+		return nil, fmt.Errorf("executor: %w", err)
+	}
+
+	// Cache the secondary index tree
+	e.indexes[stmt.IndexName] = idxTree
+
+	// Populate index from existing rows (full table scan)
+	primaryTree, err := e.getTree(stmt.TableName, schema)
+	if err != nil {
+		return nil, err
+	}
+	scanResults, err := btree.Scan(e.bp, primaryTree.RootPageID(), 0, math.MaxInt64)
+	if err != nil {
+		return nil, fmt.Errorf("executor: index backfill scan failed: %w", err)
+	}
+
+	colSchema := schema.Columns[colIdx]
+	for _, sr := range scanResults {
+		row := decodeRow(schema, sr.Value)
+		idxKey := indexKeyFromVal(row[colSchema.Name])
+		pk := sr.Key
+
+		if stmt.Unique {
+			// Check for duplicate before inserting
+			if _, found := idxTree.Search(idxKey); found {
+				// Clean up: drop the index we partially built
+				e.cat.DropIndex(stmt.TableName, stmt.IndexName)
+				delete(e.indexes, stmt.IndexName)
+				return nil, fmt.Errorf("executor: UNIQUE constraint violation on index %q: duplicate value for column %q",
+					stmt.IndexName, stmt.Column)
+			}
+		}
+		if err := idxTree.Insert(idxKey, pk); err != nil {
+			return nil, fmt.Errorf("executor: index backfill insert failed: %w", err)
+		}
+		// Update catalog if root changed during backfill
+		newRoot := idxTree.RootPageID()
+		if idxSch, _ := e.cat.GetIndex(stmt.TableName, stmt.IndexName); idxSch != nil && newRoot != idxSch.RootPageID {
+			e.cat.UpdateIndexRootPageID(stmt.TableName, stmt.IndexName, newRoot)
+		}
+	}
+
+	rs := NewResultSet([]string{"result"})
+	rs.AddRow(Row{"result": fmt.Sprintf("Index %q created on %s(%s)", stmt.IndexName, stmt.TableName, stmt.Column)})
+	return rs, nil
+}
+
+// ---- DROP INDEX ----
+
+func (e *Executor) executeDropIndex(stmt *parser.DropIndexStmt) (*ResultSet, error) {
+	if err := e.cat.DropIndex(stmt.TableName, stmt.IndexName); err != nil {
+		return nil, fmt.Errorf("executor: %w", err)
+	}
+	delete(e.indexes, stmt.IndexName)
+	rs := NewResultSet([]string{"result"})
+	rs.AddRow(Row{"result": fmt.Sprintf("Index %q dropped", stmt.IndexName)})
+	return rs, nil
+}
+
+// ---- SHOW INDEXES ----
+
+func (e *Executor) executeShowIndexes(stmt *parser.ShowIndexesStmt) (*ResultSet, error) {
+	cols := []string{"index_name", "table_name", "column", "unique"}
+	rs := NewResultSet(cols)
+
+	tables := e.cat.ListTables()
+	for _, tname := range tables {
+		if stmt.TableName != "" && tname != stmt.TableName {
+			continue
+		}
+		schema, err := e.cat.GetTable(tname)
+		if err != nil {
+			continue
+		}
+		for _, idx := range schema.Indexes {
+			rs.AddRow(Row{
+				"index_name": idx.Name,
+				"table_name": idx.TableName,
+				"column":     idx.Column,
+				"unique":     idx.Unique,
+			})
+		}
+	}
+	return rs, nil
+}
+
+// ---- Index helpers ----
+
+// indexKeyFromVal encodes a column value as an int64 key for the secondary B+ tree.
+// INT/FLOAT/BOOL are losslessly encoded; TEXT uses a stable hash (same as encodeRow).
+func indexKeyFromVal(v Value) int64 {
+	switch val := v.(type) {
+	case int64:
+		return val
+	case float64:
+		return int64(math.Float64bits(val))
+	case bool:
+		if val {
+			return 1
+		}
+		return 0
+	case string:
+		hash := int64(0)
+		for j, c := range val {
+			hash = hash*31 + int64(c)*int64(j+1)
+		}
+		return hash
+	}
+	return 0
+}
+
+
+// loadIndexTree returns the in-memory B+ tree for a secondary index.
+// If it's not cached yet (e.g., after an engine restart), it opens it from the catalog's root page.
+func (e *Executor) loadIndexTree(idx catalog.IndexSchema) *btree.BTree {
+	if tree, ok := e.indexes[idx.Name]; ok {
+		return tree
+	}
+	// Open from the persisted root page
+	tree := btree.OpenBTree(e.bp, idx.RootPageID)
+	e.indexes[idx.Name] = tree
+	return tree
+}
+
+// findSecondaryIndexScan checks whether the WHERE clause is a simple
+// `col = literal` equality on a column that has a secondary index.
+// Returns the matching IndexSchema, the encoded lookup key, and true if found.
+func (e *Executor) findSecondaryIndexScan(where parser.Expr, schema *catalog.TableSchema) (*catalog.IndexSchema, int64, bool) {
+	if where == nil || len(schema.Indexes) == 0 {
+		return nil, 0, false
+	}
+	bin, ok := where.(*parser.BinaryExpr)
+	if !ok || bin.Op != "=" {
+		return nil, 0, false
+	}
+	col, ok1 := bin.Left.(*parser.ColumnRef)
+	lit, ok2 := bin.Right.(*parser.Literal)
+	if !ok1 || !ok2 {
+		return nil, 0, false
+	}
+	for i := range schema.Indexes {
+		if schema.Indexes[i].Column == col.Name {
+			idxKey := indexKeyFromVal(lit.Value)
+			return &schema.Indexes[i], idxKey, true
+		}
+	}
+	return nil, 0, false
+}
+
 
 // ---- INSERT ----
 //
@@ -236,6 +428,30 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*ResultSet, error) {
 		e.cat.UpdateRootPageID(stmt.Table, newRoot)
 	}
 
+	// ---- Maintain secondary indexes ----
+	for _, idx := range schema.Indexes {
+		idxTree := e.loadIndexTree(idx)
+		if idxTree == nil {
+			continue
+		}
+		idxKey := indexKeyFromVal(row[idx.Column])
+		// UNIQUE check
+		if idx.Unique {
+			if _, found := idxTree.Search(idxKey); found {
+				// Roll back the primary insert
+				tree.Delete(pk)
+				return nil, fmt.Errorf("executor: UNIQUE constraint violation on index %q: duplicate value %v for column %q",
+					idx.Name, row[idx.Column], idx.Column)
+			}
+		}
+		_ = idxTree.Insert(idxKey, pk)
+		// Update catalog if index root changed
+		if newIdxRoot := idxTree.RootPageID(); newIdxRoot != idx.RootPageID {
+			e.cat.UpdateIndexRootPageID(idx.TableName, idx.Name, newIdxRoot)
+			idx.RootPageID = newIdxRoot
+		}
+	}
+
 	rs := NewResultSet([]string{"result"})
 	rs.AddRow(Row{"result": "1 row inserted"})
 	return rs, nil
@@ -255,14 +471,14 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*ResultSet, error) {
 	}
 
 	// Decide execution strategy:
-	// If WHERE clause is a simple equality on the primary key → IndexScan
-	// Otherwise → SeqScan (scan all leaf nodes)
+	// 1. WHERE pk_col = lit   → Primary Index Scan       O(log n)
+	// 2. WHERE idx_col = lit  → Secondary Index Scan     O(log n)
+	// 3. Otherwise            → Sequential Scan          O(n)
 
 	var rows []Row
 
 	if pkVal, ok := extractIndexScanKey(stmt.Where, schema); ok {
-		// ---- Index Scan: point lookup ----
-		// O(log n) — use B+ tree Search directly
+		// ---- Primary Index Scan ----
 		rowEncoded, found := tree.Search(pkVal)
 		if found {
 			row := decodeRow(schema, rowEncoded)
@@ -270,10 +486,35 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*ResultSet, error) {
 				rows = append(rows, row)
 			}
 		}
+	} else if idxSch, idxKey, ok := e.findSecondaryIndexScan(stmt.Where, schema); ok {
+		// ---- Secondary Index Scan ----
+		idxTree := e.loadIndexTree(*idxSch)
+		if idxTree != nil {
+			if pkStored, found := idxTree.Search(idxKey); found {
+				rowEncoded, found2 := tree.Search(pkStored)
+				if found2 {
+					row := decodeRow(schema, rowEncoded)
+					if e.evalWhere(stmt.Where, row) {
+						rows = append(rows, row)
+					}
+				}
+			}
+		} else {
+			// Index tree not in memory — fall back to seq scan
+			scanResults, err := btree.Scan(e.bp, tree.RootPageID(), 0, math.MaxInt64)
+			if err != nil {
+				return nil, fmt.Errorf("executor: seq scan (index fallback) failed: %w", err)
+			}
+			for _, sr := range scanResults {
+				row := decodeRow(schema, sr.Value)
+				if e.evalWhere(stmt.Where, row) {
+					rows = append(rows, row)
+				}
+			}
+		}
 	} else {
-		// ---- Sequential Scan: walk all leaf nodes ----
-		// O(n) — iterate every entry in the tree
-		scanResults, err := btree.Scan(e.bp, tree.RootPageID(), 0, math.MaxInt64) // int64 max
+		// ---- Sequential Scan ----
+		scanResults, err := btree.Scan(e.bp, tree.RootPageID(), 0, math.MaxInt64)
 		if err != nil {
 			return nil, fmt.Errorf("executor: seq scan failed: %w", err)
 		}
@@ -374,6 +615,26 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*ResultSet, error) {
 			tree.Insert(pk, newEncoded)
 			e.wal.Commit(txID)
 		}
+
+		// ---- Maintain secondary indexes ----
+		// We decode the old row to get the old indexed column values.
+		oldRow := decodeRow(schema, oldEncoded)
+		for _, idx := range schema.Indexes {
+			idxTree := e.loadIndexTree(idx)
+			if idxTree == nil {
+				continue
+			}
+			oldIdxKey := indexKeyFromVal(oldRow[idx.Column])
+			newIdxKey := indexKeyFromVal(row[idx.Column])
+			// Remove old entry
+			idxTree.Delete(oldIdxKey)
+			// Insert new entry
+			_ = idxTree.Insert(newIdxKey, pk)
+			// Update catalog if index root changed
+			if newIdxRoot := idxTree.RootPageID(); newIdxRoot != idx.RootPageID {
+				e.cat.UpdateIndexRootPageID(idx.TableName, idx.Name, newIdxRoot)
+			}
+		}
 		updateCount++
 	}
 
@@ -421,6 +682,16 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*ResultSet, error) {
 			e.wal.LogDelete(txID, schema.RootPageID, pk, oldEncoded)
 			tree.Delete(pk)
 			e.wal.Commit(txID)
+		}
+
+		// ---- Maintain secondary indexes ----
+		for _, idx := range schema.Indexes {
+			idxTree := e.loadIndexTree(idx)
+			if idxTree == nil {
+				continue
+			}
+			idxKey := indexKeyFromVal(row[idx.Column])
+			idxTree.Delete(idxKey)
 		}
 		deleteCount++
 	}
