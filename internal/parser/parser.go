@@ -97,6 +97,10 @@ func (p *Parser) parseStatement() (Statement, error) {
 		return p.parseDelete()
 	case TokenCREATE:
 		return p.parseCreate()
+	case TokenDROP:
+		return p.parseDropIndex()
+	case TokenSHOW:
+		return p.parseShowIndexes()
 	case TokenBEGIN:
 		return p.parseBegin()
 	case TokenCOMMIT:
@@ -104,7 +108,7 @@ func (p *Parser) parseStatement() (Statement, error) {
 	case TokenROLLBACK:
 		return p.parseRollback()
 	default:
-		return nil, fmt.Errorf("parser: expected SELECT/INSERT/UPDATE/DELETE/CREATE/BEGIN/COMMIT/ROLLBACK, got %q at L%d:C%d",
+		return nil, fmt.Errorf("parser: expected SELECT/INSERT/UPDATE/DELETE/CREATE/DROP/SHOW/BEGIN/COMMIT/ROLLBACK, got %q at L%d:C%d",
 			tok.Literal, tok.Line, tok.Col)
 	}
 }
@@ -406,13 +410,32 @@ func (p *Parser) parseDelete() (*DeleteStmt, error) {
 	return stmt, nil
 }
 
-// ---- CREATE TABLE ----
-// Grammar: CREATE TABLE name (col1 TYPE, col2 TYPE, ...)
+// ---- CREATE TABLE / CREATE INDEX ----
+// Grammar:
+//   CREATE TABLE name (col1 TYPE, col2 TYPE, ...)
+//   CREATE [UNIQUE] INDEX name ON table (col)
 
-func (p *Parser) parseCreate() (*CreateTableStmt, error) {
+func (p *Parser) parseCreate() (Statement, error) {
 	if err := p.expect(TokenCREATE); err != nil {
 		return nil, err
 	}
+	tok := p.peek()
+	switch tok.Type {
+	case TokenTABLE:
+		return p.parseCreateTable()
+	case TokenUNIQUE:
+		return p.parseCreateIndex(true)
+	case TokenINDEX:
+		return p.parseCreateIndex(false)
+	default:
+		return nil, fmt.Errorf("parser: expected TABLE or INDEX after CREATE, got %q at L%d:C%d",
+			tok.Literal, tok.Line, tok.Col)
+	}
+}
+
+// parseCreateTable parses: TABLE name (col1 TYPE, col2 TYPE, ...)
+// called after CREATE and TABLE tokens have been consumed by parseCreate.
+func (p *Parser) parseCreateTable() (*CreateTableStmt, error) {
 	if err := p.expect(TokenTABLE); err != nil {
 		return nil, err
 	}
@@ -452,6 +475,88 @@ func (p *Parser) parseCreate() (*CreateTableStmt, error) {
 	}
 
 	return &CreateTableStmt{TableName: tableName, Columns: cols}, nil
+}
+
+// parseCreateIndex parses: [UNIQUE] INDEX name ON table (col)
+// (called after CREATE has been consumed, unique flag already known)
+func (p *Parser) parseCreateIndex(unique bool) (*CreateIndexStmt, error) {
+	if unique {
+		if err := p.expect(TokenUNIQUE); err != nil {
+			return nil, err
+		}
+	}
+	if err := p.expect(TokenINDEX); err != nil {
+		return nil, err
+	}
+	indexName, err := p.expectIdent()
+	if err != nil {
+		return nil, fmt.Errorf("parser: expected index name: %w", err)
+	}
+	if err := p.expect(TokenON); err != nil {
+		return nil, err
+	}
+	tableName, err := p.expectIdent()
+	if err != nil {
+		return nil, fmt.Errorf("parser: expected table name after ON: %w", err)
+	}
+	if err := p.expect(TokenLPAREN); err != nil {
+		return nil, err
+	}
+	colName, err := p.expectIdent()
+	if err != nil {
+		return nil, fmt.Errorf("parser: expected column name in index definition: %w", err)
+	}
+	if err := p.expect(TokenRPAREN); err != nil {
+		return nil, err
+	}
+	return &CreateIndexStmt{
+		IndexName: indexName,
+		TableName: tableName,
+		Column:    colName,
+		Unique:    unique,
+	}, nil
+}
+
+// parseDropIndex parses: DROP INDEX name ON table
+func (p *Parser) parseDropIndex() (*DropIndexStmt, error) {
+	if err := p.expect(TokenDROP); err != nil {
+		return nil, err
+	}
+	if err := p.expect(TokenINDEX); err != nil {
+		return nil, err
+	}
+	indexName, err := p.expectIdent()
+	if err != nil {
+		return nil, fmt.Errorf("parser: expected index name after DROP INDEX: %w", err)
+	}
+	if err := p.expect(TokenON); err != nil {
+		return nil, err
+	}
+	tableName, err := p.expectIdent()
+	if err != nil {
+		return nil, fmt.Errorf("parser: expected table name after ON in DROP INDEX: %w", err)
+	}
+	return &DropIndexStmt{IndexName: indexName, TableName: tableName}, nil
+}
+
+// parseShowIndexes parses: SHOW INDEXES [FROM table]
+func (p *Parser) parseShowIndexes() (*ShowIndexesStmt, error) {
+	if err := p.expect(TokenSHOW); err != nil {
+		return nil, err
+	}
+	if err := p.expect(TokenINDEXES); err != nil {
+		return nil, err
+	}
+	stmt := &ShowIndexesStmt{}
+	if p.peek().Type == TokenFROM {
+		p.consume()
+		tableName, err := p.expectIdent()
+		if err != nil {
+			return nil, fmt.Errorf("parser: expected table name after SHOW INDEXES FROM: %w", err)
+		}
+		stmt.TableName = tableName
+	}
+	return stmt, nil
 }
 
 func (p *Parser) parseDataType() (DataType, error) {
