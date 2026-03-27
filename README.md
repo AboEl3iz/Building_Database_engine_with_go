@@ -10,10 +10,12 @@ A mini SQLite/Postgres-style database engine built from scratch in Go.
 | **Executor** | `internal/engine` | Query planner/evaluator. Coordinates B+ tree searches, joins, inserting, and secondary index maintenance. |
 | **Catalog** | `internal/catalog` | Manages schemas, tables, and secondary indexes. Persisted as JSON. |
 | **B+ Tree** | `internal/btree` | O(log n) ordered key-value storage. Used for primary tables and secondary indexes. |
-| **Buffer Pool** | `internal/buffer` | In-memory page cache with LRU eviction policy. |
+| **Buffer Pool** | `internal/buffer` | In-memory page cache with LRU eviction policy. Manages page pinning for concurrent access. |
 | **Disk Manager** | `internal/disk` | Handles raw file I/O for 4KB pages. |
+| **Row Store** | `internal/engine/rowstore.go` | Disk-backed append-only heap file for storing row data. Replaces old in-memory cache for full multi-client visibility. |
 | **WAL** | `internal/wal` | Write-Ahead Log for durability and transaction rollback. |
 | **Transaction Mgr** | `internal/txn` | Session-level `BEGIN` / `COMMIT` / `ROLLBACK` with in-memory undo log |
+| **Lock Manager** | `internal/lock` | Two-Phase Locking (2PL) component for table-level concurrency control. |
 
 ## Quick Start
 
@@ -103,6 +105,101 @@ minidb> \tables
 minidb> \desc orders
 minidb> \quit
 ```
+
+### Secondary Indexes
+```sql
+-- Create a table and populate it
+minidb> CREATE TABLE employees (id INT, name TEXT, dept INT);
+minidb> INSERT INTO employees VALUES (1, 'Alice', 10);
+minidb> INSERT INTO employees VALUES (2, 'Bob', 20);
+minidb> INSERT INTO employees VALUES (3, 'Carol', 10);
+minidb> INSERT INTO employees VALUES (4, 'Dave', 30);
+
+-- Create a secondary index on the 'dept' column
+-- Without the index: SELECT WHERE dept = 10 does a full table scan (O(n))
+-- With the index: it does an O(log n) B+ tree lookup
+minidb> CREATE INDEX idx_dept ON employees (dept);
+Index "idx_dept" created on employees(dept)
+
+-- Index-accelerated lookup (uses idx_dept automatically)
+minidb> SELECT name FROM employees WHERE dept = 10;
++-------+
+| name  |
++-------+
+| Alice |
+| Carol |
++-------+
+2 row(s)
+
+-- Create a UNIQUE index (enforces uniqueness on the column)
+minidb> CREATE UNIQUE INDEX idx_email ON employees (name);
+Index "idx_email" created on employees(name)
+
+-- Inserting a duplicate value on a UNIQUE-indexed column will fail
+minidb> INSERT INTO employees VALUES (5, 'Alice', 40);
+Error: UNIQUE constraint violation on index "idx_email"
+
+-- View all indexes on a table
+minidb> SHOW INDEXES FROM employees;
++------------+------------+--------+--------+
+| index_name | table_name | column | unique |
++------------+------------+--------+--------+
+| idx_dept   | employees  | dept   | false  |
+| idx_email  | employees  | name   | true   |
++------------+------------+--------+--------+
+
+-- Drop an index
+minidb> DROP INDEX idx_dept ON employees;
+Index "idx_dept" dropped
+
+-- After dropping, queries still work (fall back to sequential scan)
+minidb> SELECT name FROM employees WHERE dept = 10;
+-- still returns Alice and Carol, just slower (O(n) instead of O(log n))
+```
+
+> **Note:** Secondary indexes are automatically maintained during INSERT, UPDATE, and DELETE operations. When you update an indexed column, the index entry is removed and re-inserted with the new value.
+
+### Concurrency (Two-Phase Locking)
+
+MiniDB implements **strict Two-Phase Locking (2PL)** to guarantee atomic and isolated transactions (Serializable isolation level) for concurrent sessions.
+
+- **Shared Locks (Read):** Acquired automatically during `SELECT`. Multiple overlapping reads from different transactions are allowed.
+- **Exclusive Locks (Write):** Acquired automatically during `INSERT`, `UPDATE`, and `DELETE`. Blocks other transactions from reading or writing the same table until the transaction ends.
+
+Locks are acquired on demand (the *Growing Phase*) and released all at once on `COMMIT` or `ROLLBACK` (the *Shrinking Phase*).
+If a transaction requests a lock that conflicts with another transaction, it immediately receives an error rather than blocking (to avoid deadlocks).
+
+```sql
+-- Transaction 1 (Session A)
+minidb> BEGIN;
+minidb> SELECT * FROM employees;
+-- Acquires a SHARED lock on 'employees'
+
+-- Transaction 2 (Session B)
+minidb> BEGIN;
+minidb> SELECT * FROM employees;
+-- Succeeds! (Multiple readers can hold SHARED locks)
+
+minidb> UPDATE employees SET dept = 20 WHERE id = 1;
+-- Fails! Error: cannot acquire EXCLUSIVE lock on "employees" — SHARED locks are held by other transactions
+
+-- Transaction 1 (Session A)
+minidb> COMMIT;
+-- Releases the SHARED lock
+
+-- Transaction 2 (Session B) can now acquire the EXCLUSIVE lock
+minidb> UPDATE employees SET dept = 20 WHERE id = 1;
+minidb> COMMIT;
+```
+
+### Multi-Client Persistence
+
+Because MiniDB implements its `RowStore` and B+ Trees directly on top of the `BufferPool` and 4KB disk pages, data can now be persisted perfectly across **different terminal sessions** out-of-the-box. The old, legacy `rowCache` has been entirely removed and replaced with robust Type-Tagged Binary Serialization, keeping your datasets fully durable.
+
+1. Terminal 1 connects to `minidb`.
+2. CREATE TABLE and INSERT rows.
+3. Terminal 2 connects to `minidb` concurrently.
+4. Terminal 2 runs SELECT and instantly reads the rows appended to the RowStore on disk.
 
 ## Running Tests
 
@@ -244,11 +341,12 @@ BOOL   -- boolean (literals: TRUE, FALSE)
 ## Key Design Decisions
 
 1.  **Page size:** 4096 bytes (matches OS virtual memory page = efficient I/O).
-2.  **Index structure:** B+ Tree (O(log n) point lookup + O(log n + k) range scan).
+2.  **Index structure:** B+ Tree (O(log n) point lookup + O(log n + k) range scan). BTree values store a compound 64-bit disk pointer `(PageID << 32) | SlotOffset` allowing lookup to the `RowStore`.
 3.  **Cache policy:** LRU (simple, effective for most workloads).
 4.  **Write-Ahead Log (WAL):** Ensures durability (so crash recovery is possible) and allows transactions to be rolled back.
 5.  **No query optimizer (yet):** Queries are executed using simple heuristics (e.g. use an index if `WHERE primary_key = lit` or `WHERE indexed_col = lit`, otherwise sequential scan).
-6.  **Secondary Indexes:** Stored as separate B+ trees where the key is the indexed column value and the value is the primary key. Planners transparently use them for O(log n) equality lookups.
+6.  **Secondary Indexes:** Stored as separate B+ trees where the key is a composite value `(indexed_value << 32) | PK` to allow duplicates, and the value is the primary key. Planners transparently use them for O(log n) equality lookups.
+7.  **Heap Persistence:** Replaced in-memory globally-shared row cache with a disk-persistent `RowStore`. Rows are serialized into dense Byte arrays on buffer pool pages.
 
 ## Extending MiniDB
 
@@ -263,6 +361,15 @@ Because it's written from scratch and highly modular, you can easily add:
 - **`COMMIT [TRANSACTION]`** — writes WAL COMMIT record + `fsync`, finalises transaction
 - **`ROLLBACK [TRANSACTION]`** — applies undo log in reverse, writes WAL ABORT record
 - Auto-commit preserved — every DML without `BEGIN` still auto-begins and auto-commits
+
+---
+
+### v3.0 — Persistent Architecture & Concurrency Control (2026-03-27)
+
+#### New Architecture
+- **RowStore Heap Persistence:** Completely removed in-memory `rowCache` map and moved to a 4KB `BufferPool` page-backed continuous heap file. `RowStore` fully unblocks multi-session clients allowing simultaneous, durable file usage in `minidb`.
+- **Secondary Index Composite Keys:** Fixed primary key constraint collisions on secondary indexes. Secondary indexes now store keys as `(indexed_value << 32 | primary_key)` composite 64-bit chunks resolving overlapping values (such as ages).
+- **BufferPool Edge Case Fixes:** Prevented Memory Page tracking eviction bugs via exact frame updates on `BufferPool.NewPage`, and enforced precise slice mutations to avoid slice-value overwrite dropping memory edits.
 
 #### Files Changed
 | File | Change |
