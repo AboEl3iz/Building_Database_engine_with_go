@@ -1,6 +1,7 @@
 // Package txn provides a session-level transaction manager for MiniDB.
 //
-// It wraps the WAL and provides explicit BEGIN / COMMIT / ROLLBACK semantics.
+// It wraps the WAL and provides explicit BEGIN / COMMIT / ROLLBACK semantics
+// with Two-Phase Locking (2PL) for concurrency control.
 //
 // State machine:
 //
@@ -12,17 +13,25 @@
 // in-memory "undo log" so that ROLLBACK can reverse the changes without
 // needing to re-read the WAL file.
 //
+// Two-Phase Locking (2PL):
+//
+//	Growing phase:   Locks are acquired as needed (Lock calls during DML).
+//	Shrinking phase: ALL locks are released at once during COMMIT or ROLLBACK.
+//
+// This is called "strict 2PL" because locks are held until the transaction ends.
+//
 // ACID guarantees:
 //
 //	A (Atomicity):   ROLLBACK applies every undo op in reverse order.
 //	C (Consistency): Enforced by the executor (schema checks, type checks).
-//	I (Isolation):   Single-threaded engine – no concurrent conflicts.
+//	I (Isolation):   Strict 2PL prevents dirty reads, lost updates, and write skew.
 //	D (Durability):  COMMIT causes WAL.Commit() → file.Sync().
 package txn
 
 import (
 	"fmt"
 	"minidb/internal/btree"
+	"minidb/internal/lock"
 	"minidb/internal/wal"
 )
 
@@ -52,15 +61,32 @@ type UndoOp struct {
 // All mutation helpers (LogInsert, LogUpdate, LogDelete) are called by the
 // Executor after it performs the actual B+ tree operation so that we can
 // record what needs to be undone.
+//
+// The LockManager is shared across all TxManager instances to coordinate
+// concurrent access using Two-Phase Locking.
 type TxManager struct {
 	w          *wal.WAL
-	activeTxID wal.TxID // 0 means no active transaction
-	undoLog    []UndoOp // accumulated in the order operations happened
+	lm         *lock.LockManager // shared lock manager for 2PL
+	activeTxID wal.TxID          // 0 means no active transaction
+	undoLog    []UndoOp          // accumulated in the order operations happened
 }
 
 // NewTxManager creates a TxManager backed by the given WAL.
-func NewTxManager(w *wal.WAL) *TxManager {
-	return &TxManager{w: w}
+// If a LockManager is provided, it is used for 2PL concurrency control.
+// If nil, a new default LockManager is created.
+func NewTxManager(w *wal.WAL, lm ...*lock.LockManager) *TxManager {
+	var lockMgr *lock.LockManager
+	if len(lm) > 0 && lm[0] != nil {
+		lockMgr = lm[0]
+	} else {
+		lockMgr = lock.NewLockManager()
+	}
+	return &TxManager{w: w, lm: lockMgr}
+}
+
+// LockManager returns the lock manager used by this transaction manager.
+func (tm *TxManager) LockManager() *lock.LockManager {
+	return tm.lm
 }
 
 // IsActive reports whether a user transaction is currently open.
@@ -72,6 +98,20 @@ func (tm *TxManager) IsActive() bool {
 // Returns 0 if no transaction is active.
 func (tm *TxManager) ActiveTxID() wal.TxID {
 	return tm.activeTxID
+}
+
+// AcquireLock acquires a table-level lock for the current transaction.
+// This is called by the Executor before executing DML statements.
+//
+// In 2PL, this is the "growing phase" — locks can only be acquired, not released.
+// Returns an error if:
+//   - No transaction is active
+//   - Another transaction holds a conflicting lock
+func (tm *TxManager) AcquireLock(tableName string, mode lock.LockMode) error {
+	if !tm.IsActive() {
+		return nil // auto-commit mode — no lock needed (single-statement txn)
+	}
+	return tm.lm.Lock(uint64(tm.activeTxID), tableName, mode)
 }
 
 // Begin opens a new explicit user transaction.
@@ -92,11 +132,14 @@ func (tm *TxManager) Begin() error {
 
 // Commit finalises the current transaction durably.
 // Calls WAL.Commit which writes the COMMIT record and calls file.Sync().
+// Releases all locks held by this transaction (shrinking phase of 2PL).
 func (tm *TxManager) Commit() error {
 	if !tm.IsActive() {
 		return fmt.Errorf("txn: no active transaction to commit")
 	}
 	txID := tm.activeTxID
+	// Release all locks (shrinking phase of 2PL)
+	tm.lm.ReleaseAll(uint64(txID))
 	tm.reset()
 	if err := tm.w.Commit(txID); err != nil {
 		return fmt.Errorf("txn: WAL Commit failed: %w", err)
@@ -106,6 +149,7 @@ func (tm *TxManager) Commit() error {
 
 // Rollback reverses all mutations recorded in the undo log (last-in, first-out)
 // and writes an ABORT record to the WAL.
+// Releases all locks held by this transaction (shrinking phase of 2PL).
 func (tm *TxManager) Rollback() error {
 	if !tm.IsActive() {
 		return fmt.Errorf("txn: no active transaction to roll back")
@@ -127,6 +171,8 @@ func (tm *TxManager) Rollback() error {
 		}
 	}
 	txID := tm.activeTxID
+	// Release all locks (shrinking phase of 2PL)
+	tm.lm.ReleaseAll(uint64(txID))
 	tm.reset()
 	// Write ABORT record to WAL (best-effort; don't shadow the rollback error).
 	_ = tm.w.Abort(txID, nil) // nil tree — we already did undo above

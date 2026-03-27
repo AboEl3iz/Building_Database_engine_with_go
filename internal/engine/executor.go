@@ -7,6 +7,7 @@ import (
 	"minidb/internal/btree"
 	"minidb/internal/buffer"
 	"minidb/internal/catalog"
+	"minidb/internal/lock"
 	"minidb/internal/parser"
 	"minidb/internal/txn"
 	"minidb/internal/wal"
@@ -30,7 +31,7 @@ type Executor struct {
 	bp      *buffer.BufferPool
 	cat     *catalog.Catalog
 	wal     *wal.WAL
-	txm     *txn.TxManager       // session-level transaction manager
+	txm     *txn.TxManager          // session-level transaction manager
 	trees   map[string]*btree.BTree // table name → B+ tree
 	indexes map[string]*btree.BTree // index name → secondary B+ tree
 }
@@ -296,7 +297,6 @@ func indexKeyFromVal(v Value) int64 {
 	return 0
 }
 
-
 // loadIndexTree returns the in-memory B+ tree for a secondary index.
 // If it's not cached yet (e.g., after an engine restart), it opens it from the catalog's root page.
 func (e *Executor) loadIndexTree(idx catalog.IndexSchema) *btree.BTree {
@@ -334,7 +334,6 @@ func (e *Executor) findSecondaryIndexScan(where parser.Expr, schema *catalog.Tab
 	return nil, 0, false
 }
 
-
 // ---- INSERT ----
 //
 // Row encoding: we encode the full row as a value in the B+ tree.
@@ -355,6 +354,11 @@ func (e *Executor) findSecondaryIndexScan(where parser.Expr, schema *catalog.Tab
 // and store them with the key. For TEXT, we store a hash (simplified).
 
 func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*ResultSet, error) {
+	// 2PL: acquire EXCLUSIVE lock on the table (writes need exclusive access)
+	if err := e.txm.AcquireLock(stmt.Table, lock.LockExclusive); err != nil {
+		return nil, fmt.Errorf("executor: %w", err)
+	}
+
 	schema, err := e.cat.GetTable(stmt.Table)
 	if err != nil {
 		return nil, err
@@ -460,6 +464,11 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*ResultSet, error) {
 // ---- SELECT ----
 
 func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*ResultSet, error) {
+	// 2PL: acquire SHARED lock on the table (reads allow concurrent readers)
+	if err := e.txm.AcquireLock(stmt.Table, lock.LockShared); err != nil {
+		return nil, fmt.Errorf("executor: %w", err)
+	}
+
 	schema, err := e.cat.GetTable(stmt.Table)
 	if err != nil {
 		return nil, err
@@ -563,6 +572,11 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*ResultSet, error) {
 // ---- UPDATE ----
 
 func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*ResultSet, error) {
+	// 2PL: acquire EXCLUSIVE lock on the table (writes need exclusive access)
+	if err := e.txm.AcquireLock(stmt.Table, lock.LockExclusive); err != nil {
+		return nil, fmt.Errorf("executor: %w", err)
+	}
+
 	schema, err := e.cat.GetTable(stmt.Table)
 	if err != nil {
 		return nil, err
@@ -646,6 +660,11 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*ResultSet, error) {
 // ---- DELETE ----
 
 func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*ResultSet, error) {
+	// 2PL: acquire EXCLUSIVE lock on the table (writes need exclusive access)
+	if err := e.txm.AcquireLock(stmt.Table, lock.LockExclusive); err != nil {
+		return nil, fmt.Errorf("executor: %w", err)
+	}
+
 	schema, err := e.cat.GetTable(stmt.Table)
 	if err != nil {
 		return nil, err
@@ -1075,6 +1094,14 @@ func (e *Executor) DescribeTable(tableName string) (string, error) {
 //
 // Performance: O(n × m) — fine for small tables. A real DB would use a HashJoin.
 func (e *Executor) executeJoinSelect(stmt *parser.SelectStmt) (*ResultSet, error) {
+	// 2PL: acquire SHARED locks on both tables involved in the JOIN
+	if err := e.txm.AcquireLock(stmt.Table, lock.LockShared); err != nil {
+		return nil, fmt.Errorf("executor: %w", err)
+	}
+	if err := e.txm.AcquireLock(stmt.Join.Table, lock.LockShared); err != nil {
+		return nil, fmt.Errorf("executor: %w", err)
+	}
+
 	// Fetch left table
 	leftSchema, err := e.cat.GetTable(stmt.Table)
 	if err != nil {
