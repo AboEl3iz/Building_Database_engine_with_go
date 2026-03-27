@@ -217,7 +217,7 @@ func (t *BTree) splitLeaf(leaf *Node) error {
 	// Allocate new right leaf
 	rightPage, err := t.bp.NewPage()
 	if err != nil {
-		return fmt.Errorf("btree: cannot allocate right leaf: %w", err)
+		return err
 	}
 	right := NewNodeFromPage(rightPage)
 	right.InitLeaf(leaf.ParentID())

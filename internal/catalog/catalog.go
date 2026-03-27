@@ -30,6 +30,7 @@ type TableSchema struct {
 	Name       string              // table name (e.g., "users")
 	Columns    []ColumnSchema      // ordered list of columns
 	RootPageID disk.PageID         // PageID of the B+ tree root for this table
+	HeapPageID disk.PageID         // PageID of the row store (heap) for this table
 	ColIndex   map[string]int      // column name → index (for fast lookup)
 	Indexes    []IndexSchema       // secondary indexes on this table
 }
@@ -81,7 +82,7 @@ func NewCatalog(filePath string) (*Catalog, error) {
 
 // CreateTable registers a new table schema in the catalog.
 // Returns an error if a table with the same name already exists.
-func (c *Catalog) CreateTable(name string, columns []parser.ColumnDef, rootPageID disk.PageID) error {
+func (c *Catalog) CreateTable(name string, columns []parser.ColumnDef, rootPageID disk.PageID, heapPageID disk.PageID) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -105,6 +106,7 @@ func (c *Catalog) CreateTable(name string, columns []parser.ColumnDef, rootPageI
 		Name:       name,
 		Columns:    colSchemas,
 		RootPageID: rootPageID,
+		HeapPageID: heapPageID,
 		ColIndex:   colIndex,
 	}
 
@@ -261,6 +263,7 @@ type tableJSON struct {
 	Name       string       `json:"name"`
 	Columns    []columnJSON `json:"columns"`
 	RootPageID uint32       `json:"root_page_id"`
+	HeapPageID uint32       `json:"heap_page_id"`
 	Indexes    []indexJSON  `json:"indexes,omitempty"`
 }
 
@@ -285,6 +288,7 @@ func (c *Catalog) persist() error {
 		tj := tableJSON{
 			Name:       schema.Name,
 			RootPageID: uint32(schema.RootPageID),
+			HeapPageID: uint32(schema.HeapPageID),
 		}
 		for _, col := range schema.Columns {
 			tj.Columns = append(tj.Columns, columnJSON{
@@ -347,6 +351,7 @@ func (c *Catalog) loadFromJSON(data []byte) error {
 			Name:       tj.Name,
 			Columns:    colSchemas,
 			RootPageID: disk.PageID(tj.RootPageID),
+			HeapPageID: disk.PageID(tj.HeapPageID),
 			ColIndex:   colIndex,
 			Indexes:    idxSchemas,
 		}

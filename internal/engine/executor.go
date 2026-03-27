@@ -31,9 +31,10 @@ type Executor struct {
 	bp      *buffer.BufferPool
 	cat     *catalog.Catalog
 	wal     *wal.WAL
-	txm     *txn.TxManager          // session-level transaction manager
-	trees   map[string]*btree.BTree // table name → B+ tree
-	indexes map[string]*btree.BTree // index name → secondary B+ tree
+	txm       *txn.TxManager          // session-level transaction manager
+	trees     map[string]*btree.BTree // table name → B+ tree
+	indexes   map[string]*btree.BTree // index name → secondary B+ tree
+	rowStores map[string]*RowStore    // table name → heap row store
 }
 
 // NewExecutor creates an Executor with the given dependencies.
@@ -47,10 +48,11 @@ func NewExecutor(bp *buffer.BufferPool, cat *catalog.Catalog, w *wal.WAL, txm ..
 	return &Executor{
 		bp:      bp,
 		cat:     cat,
-		wal:     w,
-		txm:     tm,
-		trees:   make(map[string]*btree.BTree),
-		indexes: make(map[string]*btree.BTree),
+		wal:       w,
+		txm:       tm,
+		trees:     make(map[string]*btree.BTree),
+		indexes:   make(map[string]*btree.BTree),
+		rowStores: make(map[string]*RowStore),
 	}
 }
 
@@ -135,19 +137,26 @@ func (e *Executor) executeCreate(stmt *parser.CreateTableStmt) (*ResultSet, erro
 		return nil, fmt.Errorf("executor: table %q already exists", stmt.TableName)
 	}
 
-	// Allocate a new B+ tree for this table
+	// Create the primary B+ tree
 	tree, err := btree.NewBTree(e.bp)
 	if err != nil {
-		return nil, fmt.Errorf("executor: cannot create B+ tree for %q: %w", stmt.TableName, err)
+		return nil, fmt.Errorf("executor: cannot create B+ tree: %w", err)
 	}
 
-	// Register in catalog with the tree's root page ID
-	if err := e.cat.CreateTable(stmt.TableName, stmt.Columns, tree.RootPageID()); err != nil {
+	// Create a new RowStore for this table
+	rowStore, heapPageID, err := NewRowStore(e.bp)
+	if err != nil {
+		return nil, fmt.Errorf("executor: cannot create RowStore: %w", err)
+	}
+
+	// Register in catalog with the tree's root page ID and heap page ID
+	if err := e.cat.CreateTable(stmt.TableName, stmt.Columns, tree.RootPageID(), heapPageID); err != nil {
 		return nil, fmt.Errorf("executor: catalog error: %w", err)
 	}
 
-	// Cache the tree
+	// Cache the tree and row store
 	e.trees[stmt.TableName] = tree
+	e.rowStores[stmt.TableName] = rowStore
 
 	rs := NewResultSet([]string{"result"})
 	rs.AddRow(Row{"result": fmt.Sprintf("Table %q created", stmt.TableName)})
@@ -203,14 +212,28 @@ func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*ResultSet,
 	}
 
 	colSchema := schema.Columns[colIdx]
+	
+	rowStore := e.getRowStore(stmt.TableName, schema)
+	
 	for _, sr := range scanResults {
-		row := decodeRow(schema, sr.Value)
+		rowBytes, err := rowStore.Read(sr.Value)
+		if err != nil {
+			return nil, fmt.Errorf("executor: row read failed: %w", err)
+		}
+		row, err := UnpackRowBytes(schema, rowBytes)
+		if err != nil {
+			return nil, fmt.Errorf("executor: row unpack failed: %w", err)
+		}
 		idxKey := indexKeyFromVal(row[colSchema.Name])
 		pk := sr.Key
 
 		if stmt.Unique {
 			// Check for duplicate before inserting
-			if _, found := idxTree.Search(idxKey); found {
+			// For UNIQUE index, look for any entry matching idxKey
+			startKey := compositeIndexKey(idxKey, 0)
+			endKey := compositeIndexKey(idxKey, math.MaxInt32)
+			matches, _ := btree.Scan(e.bp, idxTree.RootPageID(), startKey, endKey)
+			if len(matches) > 0 {
 				// Clean up: drop the index we partially built
 				e.cat.DropIndex(stmt.TableName, stmt.IndexName)
 				delete(e.indexes, stmt.IndexName)
@@ -218,7 +241,9 @@ func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*ResultSet,
 					stmt.IndexName, stmt.Column)
 			}
 		}
-		if err := idxTree.Insert(idxKey, pk); err != nil {
+		
+		compKey := compositeIndexKey(idxKey, pk)
+		if err := idxTree.Insert(compKey, pk); err != nil {
 			return nil, fmt.Errorf("executor: index backfill insert failed: %w", err)
 		}
 		// Update catalog if root changed during backfill
@@ -231,6 +256,12 @@ func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*ResultSet,
 	rs := NewResultSet([]string{"result"})
 	rs.AddRow(Row{"result": fmt.Sprintf("Index %q created on %s(%s)", stmt.IndexName, stmt.TableName, stmt.Column)})
 	return rs, nil
+}
+
+// compositeIndexKey packs a secondary index value (hash or direct) and a primary key into an int64.
+// This allows a single secondary value to map to multiple primary keys in the BTree.
+func compositeIndexKey(idxKey int64, pk int64) int64 {
+	return (idxKey << 32) | (pk & 0xFFFFFFFF)
 }
 
 // ---- DROP INDEX ----
@@ -333,6 +364,7 @@ func (e *Executor) findSecondaryIndexScan(where parser.Expr, schema *catalog.Tab
 	}
 	return nil, 0, false
 }
+// fmt.Printf("DEBUG executeInsert: inserted pk=%d rowEncoded=%d\n", pk, rowEncoded)
 
 // ---- INSERT ----
 //
@@ -385,10 +417,12 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*ResultSet, error) {
 		return nil, err
 	}
 
-	// Encode row as bytes, pack into an int64 representation
-	rowEncoded, err := e.insertRowWithCache(schema, row)
+	// Encode row as bytes and append to row store
+	rowStore := e.getRowStore(stmt.Table, schema)
+	rowBytes := PackRowBytes(schema, row)
+	rowEncoded, err := rowStore.Append(rowBytes)
 	if err != nil {
-		return nil, fmt.Errorf("executor: row encoding failed: %w", err)
+		return nil, fmt.Errorf("executor: row append failed: %w", err)
 	}
 
 	// Get (or rebuild) the B+ tree for this table
@@ -441,14 +475,19 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*ResultSet, error) {
 		idxKey := indexKeyFromVal(row[idx.Column])
 		// UNIQUE check
 		if idx.Unique {
-			if _, found := idxTree.Search(idxKey); found {
+			startKey := compositeIndexKey(idxKey, 0)
+			endKey := compositeIndexKey(idxKey, math.MaxInt32)
+			matches, _ := btree.Scan(e.bp, idxTree.RootPageID(), startKey, endKey)
+			if len(matches) > 0 {
 				// Roll back the primary insert
 				tree.Delete(pk)
 				return nil, fmt.Errorf("executor: UNIQUE constraint violation on index %q: duplicate value %v for column %q",
 					idx.Name, row[idx.Column], idx.Column)
 			}
 		}
-		_ = idxTree.Insert(idxKey, pk)
+		
+		compKey := compositeIndexKey(idxKey, pk)
+		_ = idxTree.Insert(compKey, pk)
 		// Update catalog if index root changed
 		if newIdxRoot := idxTree.RootPageID(); newIdxRoot != idx.RootPageID {
 			e.cat.UpdateIndexRootPageID(idx.TableName, idx.Name, newIdxRoot)
@@ -486,11 +525,14 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*ResultSet, error) {
 
 	var rows []Row
 
+	rowStore := e.getRowStore(stmt.Table, schema)
+
 	if pkVal, ok := extractIndexScanKey(stmt.Where, schema); ok {
 		// ---- Primary Index Scan ----
 		rowEncoded, found := tree.Search(pkVal)
 		if found {
-			row := decodeRow(schema, rowEncoded)
+			rowBytes, _ := rowStore.Read(rowEncoded)
+			row, _ := UnpackRowBytes(schema, rowBytes)
 			if e.evalWhere(stmt.Where, row) {
 				rows = append(rows, row)
 			}
@@ -499,10 +541,15 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*ResultSet, error) {
 		// ---- Secondary Index Scan ----
 		idxTree := e.loadIndexTree(*idxSch)
 		if idxTree != nil {
-			if pkStored, found := idxTree.Search(idxKey); found {
+			startKey := compositeIndexKey(idxKey, 0)
+			endKey := compositeIndexKey(idxKey, math.MaxInt32)
+			matches, _ := btree.Scan(e.bp, idxTree.RootPageID(), startKey, endKey)
+			for _, match := range matches {
+				pkStored := match.Value
 				rowEncoded, found2 := tree.Search(pkStored)
 				if found2 {
-					row := decodeRow(schema, rowEncoded)
+					rowBytes, _ := rowStore.Read(rowEncoded)
+					row, _ := UnpackRowBytes(schema, rowBytes)
 					if e.evalWhere(stmt.Where, row) {
 						rows = append(rows, row)
 					}
@@ -515,7 +562,8 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*ResultSet, error) {
 				return nil, fmt.Errorf("executor: seq scan (index fallback) failed: %w", err)
 			}
 			for _, sr := range scanResults {
-				row := decodeRow(schema, sr.Value)
+				rowBytes, _ := rowStore.Read(sr.Value)
+				row, _ := UnpackRowBytes(schema, rowBytes)
 				if e.evalWhere(stmt.Where, row) {
 					rows = append(rows, row)
 				}
@@ -528,7 +576,8 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*ResultSet, error) {
 			return nil, fmt.Errorf("executor: seq scan failed: %w", err)
 		}
 		for _, sr := range scanResults {
-			row := decodeRow(schema, sr.Value)
+			rowBytes, _ := rowStore.Read(sr.Value)
+			row, _ := UnpackRowBytes(schema, rowBytes)
 			if e.evalWhere(stmt.Where, row) {
 				rows = append(rows, row)
 			}
@@ -593,9 +642,12 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*ResultSet, error) {
 		return nil, err
 	}
 
+	rowStore := e.getRowStore(stmt.Table, schema)
+
 	updateCount := 0
 	for _, sr := range scanResults {
-		row := decodeRow(schema, sr.Value)
+		rowBytes, _ := rowStore.Read(sr.Value)
+		row, _ := UnpackRowBytes(schema, rowBytes)
 		if !e.evalWhere(stmt.Where, row) {
 			continue
 		}
@@ -612,8 +664,12 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*ResultSet, error) {
 			row[assign.Column] = val
 		}
 
-		newEncoded := encodeRow(schema, row)
-		storeRowInCache(schema, row, newEncoded)
+		// Encode new row and append to row store
+		newRowBytes := PackRowBytes(schema, row)
+		newEncoded, err := rowStore.Append(newRowBytes)
+		if err != nil {
+			return nil, err
+		}
 
 		if e.txm.IsActive() {
 			// ---- Explicit transaction mode ----
@@ -631,8 +687,9 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*ResultSet, error) {
 		}
 
 		// ---- Maintain secondary indexes ----
-		// We decode the old row to get the old indexed column values.
-		oldRow := decodeRow(schema, oldEncoded)
+		// We read the old row to get the old indexed column values.
+		oldRowBytes, _ := rowStore.Read(oldEncoded)
+		oldRow, _ := UnpackRowBytes(schema, oldRowBytes)
 		for _, idx := range schema.Indexes {
 			idxTree := e.loadIndexTree(idx)
 			if idxTree == nil {
@@ -640,10 +697,15 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*ResultSet, error) {
 			}
 			oldIdxKey := indexKeyFromVal(oldRow[idx.Column])
 			newIdxKey := indexKeyFromVal(row[idx.Column])
+			
 			// Remove old entry
-			idxTree.Delete(oldIdxKey)
+			oldCompKey := compositeIndexKey(oldIdxKey, pk)
+			idxTree.Delete(oldCompKey)
+			
 			// Insert new entry
-			_ = idxTree.Insert(newIdxKey, pk)
+			newCompKey := compositeIndexKey(newIdxKey, pk)
+			_ = idxTree.Insert(newCompKey, pk)
+			
 			// Update catalog if index root changed
 			if newIdxRoot := idxTree.RootPageID(); newIdxRoot != idx.RootPageID {
 				e.cat.UpdateIndexRootPageID(idx.TableName, idx.Name, newIdxRoot)
@@ -680,9 +742,12 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*ResultSet, error) {
 		return nil, err
 	}
 
+	rowStore := e.getRowStore(stmt.Table, schema)
+
 	deleteCount := 0
 	for _, sr := range scanResults {
-		row := decodeRow(schema, sr.Value)
+		rowBytes, _ := rowStore.Read(sr.Value)
+		row, _ := UnpackRowBytes(schema, rowBytes)
 		if !e.evalWhere(stmt.Where, row) {
 			continue
 		}
@@ -710,7 +775,8 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*ResultSet, error) {
 				continue
 			}
 			idxKey := indexKeyFromVal(row[idx.Column])
-			idxTree.Delete(idxKey)
+			compKey := compositeIndexKey(idxKey, pk)
+			idxTree.Delete(compKey)
 		}
 		deleteCount++
 	}
@@ -730,6 +796,16 @@ func (e *Executor) getTree(tableName string, schema *catalog.TableSchema) (*btre
 	tree := btree.OpenBTree(e.bp, schema.RootPageID)
 	e.trees[tableName] = tree
 	return tree, nil
+}
+
+// getRowStore returns the RowStore for a table, loading it from the catalog if needed.
+func (e *Executor) getRowStore(tableName string, schema *catalog.TableSchema) *RowStore {
+	if rs, ok := e.rowStores[tableName]; ok {
+		return rs
+	}
+	rs := OpenRowStore(e.bp, schema.HeapPageID)
+	e.rowStores[tableName] = rs
+	return rs
 }
 
 // evalWhere evaluates the WHERE clause against a row.
@@ -845,98 +921,6 @@ func resolveColumns(cols []string, schema *catalog.TableSchema) []string {
 	return cols
 }
 
-// ---- Row Encoding / Decoding ----
-//
-// We need to store a full row (multiple columns) as a single int64 in the B+ tree.
-//
-// SIMPLIFIED ENCODING:
-// Since our B+ tree stores int64 keys and int64 values, we pack the row
-// into a page-level "row store" and return a page+offset reference.
-//
-// For this implementation, we use a compact in-memory encoding:
-//   - For tables with only INT columns: XOR-fold all values into one int64
-//   - For TEXT columns: store a simple hash
-//
-// A REAL implementation would:
-//   1. Store variable-length rows in a separate "heap file" (like PostgreSQL's)
-//   2. The B+ tree value = (pageID, slotID) pointing into the heap file
-//   3. Or: inline short rows directly in the leaf node (like SQLite)
-//
-// For learning purposes, we use a simple encoding sufficient to demonstrate
-// all the database concepts without heap file complexity.
-
-// encodeRow packs a row into an int64 for B+ tree storage.
-// NOTE: This is a simplification — a real DB would store rows in heap pages.
-func encodeRow(schema *catalog.TableSchema, row Row) int64 {
-	var encoded int64
-	for i, col := range schema.Columns {
-		if i >= 8 { // we only support 8 columns in this simplified encoding
-			break
-		}
-		val := row[col.Name]
-		switch v := val.(type) {
-		case int64:
-			encoded ^= v << (uint(i) * 7 % 56)
-		case float64:
-			// Treat float bits as int64 for XOR encoding
-			encoded ^= int64(math.Float64bits(v)) << (uint(i) * 7 % 56)
-		case bool:
-			if v {
-				encoded ^= int64(1) << (uint(i) * 7 % 56)
-			}
-		case string:
-			hash := int64(0)
-			for j, c := range v {
-				hash = hash*31 + int64(c)*int64(j+1)
-			}
-			encoded ^= hash << (uint(i) * 7 % 56)
-		}
-	}
-	return encoded
-}
-
-// decodeRow reconstructs a Row from an encoded int64 and schema.
-//
-// NOTE: Because encodeRow uses a lossy encoding (XOR-folding), this
-// reconstruction is APPROXIMATE for TEXT columns and multi-column tables.
-// In a real database, we'd store the full row bytes.
-//
-// For learning/demo purposes, we store the original values separately
-// using a global row cache (in-memory; lost on restart).
-var rowCache = make(map[int64]map[string]Value) // encoded → original values
-
-func decodeRow(schema *catalog.TableSchema, encoded int64) Row {
-	// Check our in-memory cache for the original row
-	if cached, ok := rowCache[encoded]; ok {
-		row := make(Row, len(cached))
-		for k, v := range cached {
-			row[k] = v
-		}
-		return row
-	}
-
-	// If not cached (e.g., after restart), return a placeholder row with the key
-	row := make(Row)
-	for _, col := range schema.Columns {
-		if col.Type == parser.DataTypeInt {
-			row[col.Name] = encoded // best approximation
-		} else {
-			row[col.Name] = "(data lost on restart)"
-		}
-	}
-	return row
-}
-
-// storeRowInCache saves the original row values before encoding.
-// Called by executeInsert to enable later decoding.
-func storeRowInCache(schema *catalog.TableSchema, row Row, encoded int64) {
-	cached := make(map[string]Value)
-	for _, col := range schema.Columns {
-		cached[col.Name] = row[col.Name]
-	}
-	rowCache[encoded] = cached
-}
-
 // PackRowBytes encodes a row as a proper binary byte slice for persistence.
 // Format: [col1_type(1B) col1_data...] [col2_type(1B) col2_data...] ...
 // Type tags: 0=INT (8B), 1=TEXT (2B len + data), 2=FLOAT (8B), 3=BOOL (1B)
@@ -948,37 +932,41 @@ func PackRowBytes(schema *catalog.TableSchema, row Row) []byte {
 		val := row[col.Name]
 		var colBytes []byte
 
-		switch col.Type {
-		case parser.DataTypeInt:
-			b := make([]byte, 9) // type(1) + value(8)
-			b[0] = 0             // INT type tag
-			v, _ := val.(int64)
-			binary.LittleEndian.PutUint64(b[1:], uint64(v))
-			colBytes = b
-
-		case parser.DataTypeText:
-			s, _ := val.(string)
-			sBytes := []byte(s)
-			b := make([]byte, 3+len(sBytes)) // type(1) + len(2) + data
-			b[0] = 1                         // TEXT type tag
-			binary.LittleEndian.PutUint16(b[1:], uint16(len(sBytes)))
-			copy(b[3:], sBytes)
-			colBytes = b
-
-		case parser.DataTypeFloat:
-			b := make([]byte, 9) // type(1) + value(8)
-			b[0] = 2             // FLOAT type tag
-			v, _ := val.(float64)
-			binary.LittleEndian.PutUint64(b[1:], math.Float64bits(v))
-			colBytes = b
-
-		case parser.DataTypeBool:
-			b := make([]byte, 2) // type(1) + value(1)
-			b[0] = 3             // BOOL type tag
-			if v, _ := val.(bool); v {
-				b[1] = 1
+		if val == nil {
+			colBytes = []byte{4} // NULL type tag
+		} else {
+			switch col.Type {
+			case parser.DataTypeInt:
+				b := make([]byte, 9) // type(1) + value(8)
+				b[0] = 0             // INT type tag
+				v, _ := val.(int64)
+				binary.LittleEndian.PutUint64(b[1:], uint64(v))
+				colBytes = b
+	
+			case parser.DataTypeText:
+				s, _ := val.(string)
+				sBytes := []byte(s)
+				b := make([]byte, 3+len(sBytes)) // type(1) + len(2) + data
+				b[0] = 1                         // TEXT type tag
+				binary.LittleEndian.PutUint16(b[1:], uint16(len(sBytes)))
+				copy(b[3:], sBytes)
+				colBytes = b
+	
+			case parser.DataTypeFloat:
+				b := make([]byte, 9) // type(1) + value(8)
+				b[0] = 2             // FLOAT type tag
+				v, _ := val.(float64)
+				binary.LittleEndian.PutUint64(b[1:], math.Float64bits(v))
+				colBytes = b
+	
+			case parser.DataTypeBool:
+				b := make([]byte, 2) // type(1) + value(1)
+				b[0] = 3             // BOOL type tag
+				if v, _ := val.(bool); v {
+					b[1] = 1
+				}
+				colBytes = b
 			}
-			colBytes = b
 		}
 
 		parts = append(parts, colBytes)
@@ -1040,26 +1028,15 @@ func UnpackRowBytes(schema *catalog.TableSchema, data []byte) (Row, error) {
 			row[col.Name] = data[offset] != 0
 			offset++
 
+		case 4: // NULL
+			row[col.Name] = nil
+
 		default:
 			return nil, fmt.Errorf("executor: unknown type tag %d for column %q", typeTag, col.Name)
 		}
 	}
 
 	return row, nil
-}
-
-// ---- Enhanced INSERT with proper row caching ----
-// We override the simplified encodeRow to also populate the cache.
-
-func (e *Executor) insertRowWithCache(schema *catalog.TableSchema, row Row) (int64, error) {
-	_, err := extractPrimaryKey(schema, row)
-	if err != nil {
-		return 0, err
-	}
-
-	encoded := encodeRow(schema, row)
-	storeRowInCache(schema, row, encoded)
-	return encoded, nil
 }
 
 // DescribeTable returns a human-readable schema description.
@@ -1115,6 +1092,7 @@ func (e *Executor) executeJoinSelect(stmt *parser.SelectStmt) (*ResultSet, error
 	if err != nil {
 		return nil, fmt.Errorf("executor: JOIN left table scan failed: %w", err)
 	}
+	leftRowStore := e.getRowStore(stmt.Table, leftSchema)
 
 	// Fetch right table
 	rightSchema, err := e.cat.GetTable(stmt.Join.Table)
@@ -1129,11 +1107,13 @@ func (e *Executor) executeJoinSelect(stmt *parser.SelectStmt) (*ResultSet, error
 	if err != nil {
 		return nil, fmt.Errorf("executor: JOIN right table scan failed: %w", err)
 	}
+	rightRowStore := e.getRowStore(stmt.Join.Table, rightSchema)
 
 	// Decode all rows from both sides, storing them with qualified "table.col" keys
 	var leftRows []Row
 	for _, sr := range leftScan {
-		raw := decodeRow(leftSchema, sr.Value)
+		leftRowBytes, _ := leftRowStore.Read(sr.Value)
+		raw, _ := UnpackRowBytes(leftSchema, leftRowBytes)
 		qRow := make(Row)
 		for _, col := range leftSchema.Columns {
 			qRow[stmt.Table+"."+col.Name] = raw[col.Name]
@@ -1144,7 +1124,8 @@ func (e *Executor) executeJoinSelect(stmt *parser.SelectStmt) (*ResultSet, error
 
 	var rightRows []Row
 	for _, sr := range rightScan {
-		raw := decodeRow(rightSchema, sr.Value)
+		rightRowBytes, _ := rightRowStore.Read(sr.Value)
+		raw, _ := UnpackRowBytes(rightSchema, rightRowBytes)
 		qRow := make(Row)
 		for _, col := range rightSchema.Columns {
 			qRow[stmt.Join.Table+"."+col.Name] = raw[col.Name]
